@@ -141,6 +141,66 @@ Notes:
 
 ---
 
+## 6. Interpreting Motifs (NEW)
+
+### A. Intra-cluster differencing
+
+Within each cluster (motif) analyze variation:
+
+* compute centroid `p_k`
+* examine residuals: `r_t = z_t - p_k`
+* identify sub-structure (e.g., call variants vs noise)
+
+Purpose:
+
+* separate **signal vs nuisance variation** inside a motif
+* understand *why* embeddings are close (shared structure) and *how* they differ
+
+### B. Feature-space attribution
+
+For a pair `(z_i, z_j)` in same/different clusters:
+
+* analyze `Δ = z_i - z_j`
+* attribute dimensions back to:
+
+  * time regions
+  * frequency bands
+
+### C. Map back to spectrogram
+
+Use soft assignments `w_t[k]` to localize motifs:
+
+```text
+for each k:
+  heatmap_k(t) = w_t[k]
+```
+
+Overlay heatmaps on spectrogram to say:
+
+> "this region expresses motif k (e.g., frog-like)"
+
+### D. Motif explanations
+
+For each cluster `k`:
+
+* visualize top-N patches assigned to `k`
+* compute average spectrogram patch (prototype visualization)
+
+This yields:
+
+> interpretable acoustic templates per motif
+
+---
+
+## 7. Notes
+
+* **Local embeddings** capture structure in small spectrogram regions
+* **Clusters = motifs** discovered globally across data
+* **Soft assignment** allows **multiple signals per region**
+* **Sequences of activations** recover variable-length events
+
+---
+
 ## 6. Notes
 
 * Prefer **embedding clustering over NMFk** (scalable, robust)
