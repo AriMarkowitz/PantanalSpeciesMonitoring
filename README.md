@@ -8,7 +8,8 @@ Build a **multi-taxa bioacoustic model (birds, frogs, insects)** that:
 
 * performs strong classification
 * learns **recurring acoustic motifs**
-* can isolate **specific spectrogram patterns** that correspond to animals
+* can point to **specific spectrogram patterns** that correspond to animals
+* supports **overlapping signals via soft motif mixtures**
 * remains **deployable (CPU-friendly)**
 
 ---
@@ -16,8 +17,9 @@ Build a **multi-taxa bioacoustic model (birds, frogs, insects)** that:
 ## 1. Pipeline Overview
 
 ```text
-audio → multi-view spectrogram → local encoder → embeddings
-      → clustering (global + class)
+audio → multi-view spectrogram → local encoder → embeddings (Z)
+      → global clustering → prototypes (P)
+      → soft assignment (W)
       → motif features
       → classifier
 ```
@@ -28,164 +30,145 @@ audio → multi-view spectrogram → local encoder → embeddings
 
 ### A. Preprocessing (Multi-View Input)
 
-Instead of a single spectrogram, generate **multiple transformed views** of the same audio:
-
-* original log-mel spectrogram
+* original log-mel
 * PCEN (background suppression)
-* frequency-boosted / suppressed variant
+* frequency-boosted / suppressed variants
 
-Stack as channels:
+Stack as channels: `(freq × time × channels)`
 
-```
-(freq × time × channels)
-```
-
-Purpose:
-
-* expose the **same signal under different conditions**
-* help distinguish **animal signal vs background**
+Purpose: expose the **same signal under different conditions**.
 
 ---
 
 ### B. Local Encoder (Core)
 
-Use a **fully convolutional spectrogram encoder** that:
+Fully convolutional encoder that accepts **variable-length input** and outputs a grid of **local embeddings**:
 
-* accepts **variable-length input**
-* outputs **local embeddings** (not just clip-level)
-
-Output:
-
-```
-(time_steps × embedding_dim)
+```text
+Z = {z_1, z_2, ..., z_T}
 ```
 
-Each embedding represents a **local acoustic pattern**.
+Each `z_t` represents a **local time–frequency receptive field**.
 
-Optional:
-
-* use Perch-style embeddings as **semantic teacher features** (offline or auxiliary)
+Optional: use a foundation model (e.g., Perch) as **teacher / prior**.
 
 ---
 
-### C. Motif Discovery (Core Idea)
+### C. Global Motif Discovery (Clustering)
 
-Clustering operates on **local embeddings**, not full clips.
+Pool all local embeddings across the dataset and cluster:
 
-#### Global clustering
-
-* cluster all local embeddings (HDBSCAN)
-* learn shared acoustic “atoms”:
-
-  * insect textures
-  * frog pulses
-  * harmonics
-  * noise types
-
-#### Class-specific clustering
-
-* cluster embeddings from positive clips per class
-* learn **what that species can sound like**
-
-#### Harmonization
-
-Each local embedding is mapped to:
-
-* a **global cluster** (shared motif)
-* a **class-specific cluster** (species-specific motif)
-
----
-
-### D. Motif Features
-
-Aggregate over a clip:
-
-* histogram of global cluster activations
-* histogram of class-specific activations
-* distances to cluster centers
-* motif frequency / persistence
-
-These represent:
-
-> which acoustic patterns appear, and how strongly
-
----
-
-### E. Classifier
-
+```text
+Z_all → clustering → P = {p_1, ..., p_K}
 ```
-encoder features + motif features → MLP → multi-label output
+
+Each prototype `p_k` ≈ a **recurring acoustic motif** (frog pulse, insect texture, harmonic stack, noise, etc.).
+
+Recommended: HDBSCAN (density-based, handles noise) or k-means (simpler baseline).
+
+---
+
+### D. Soft Assignment (Key Update)
+
+Do **not** force one cluster per embedding.
+
+For each local embedding `z_t`, compute **soft weights** over prototypes:
+
+```text
+w_t[k] = softmax(sim(z_t, p_k))
+```
+
+Interpretation:
+
+* allows **overlapping signals** (e.g., frog + insect)
+* `z_t` can be a **mixture of motifs**
+
+This is a neural analogue of **mixture decomposition** (NMF-like, but learned in embedding space).
+
+---
+
+### E. Motif Features (Per File)
+
+Aggregate soft assignments over time:
+
+* motif histogram: `h_k = Σ_t w_t[k]`
+* temporal traces: `w_t[k]` over time (for localization)
+* persistence / density per motif
+
+This yields a **bag-of-motifs** representation plus **time-local activations**.
+
+---
+
+### F. Classifier
+
+```text
+[encoder pooled features + motif features] → MLP → multi-label output
 ```
 
 ---
 
 ## 3. Training Strategy
 
-1. Train baseline encoder + classifier
-2. Extract **local embeddings**
-3. Run:
+1. Initialize encoder (pretrained if possible)
+2. (Optional) multi-view **consistency** on local patches
+3. Extract local embeddings `Z`
+4. Cluster `Z_all` → prototypes `P`
+5. Compute soft assignments `W`
+6. Build motif features
+7. Train classifier (weak labels)
 
-   * global clustering
-   * class-specific clustering
-4. Score clusters using labels (keep discriminative motifs)
-5. Build motif features
-6. Train combined model
+Notes:
+
+* clustering is **offline**
+* labels are used to map motifs → species (not to define motifs)
 
 ---
 
 ## 4. Inference Modes
 
 * **Simple:** encoder + classifier
-* **Structured:** encoder + cluster lookup + classifier
-* **Optimized:** distilled lightweight model (for CPU)
+* **Structured:** encoder → soft assignments → motif features → classifier
+* **Explainable:** visualize `w_t[k]` over spectrogram ("this region is frog-like")
 
 ---
 
-## 5. Key Idea
+## 5. Key Ideas
 
-Not:
-
-> one sound per species
-
-But:
-
-> each species = **set of recurring spectrogram patterns (motifs)**
-
-Goal:
-
-> identify **which specific patterns in the spectrogram correspond to animals**
+* **Local embeddings** capture structure in small spectrogram regions
+* **Clusters = motifs** discovered globally across data
+* **Soft assignment** allows **multiple signals per region**
+* **Sequences of activations** recover variable-length events
 
 ---
 
 ## 6. Notes
 
-* Prefer **embedding clustering over NMFk** (cheaper, more robust)
-* Use **local embeddings**, not clip embeddings, for motif discovery
-* Multi-view spectrograms help expose latent signals
-* Keep clustering **offline**
-* Keep inference **lightweight**
+* Prefer **embedding clustering over NMFk** (scalable, robust)
+* Use **soft clustering** to handle mixtures
+* Keep encoder **general (pretrained) + lightly adapted**
+* Multi-view inputs help enforce **signal invariance**
 
 ---
 
 ## 7. Milestones
 
-1. Strong baseline (EfficientNet / CNN encoder)
-2. Multi-view spectrogram input
-3. Extract local embeddings + cluster
-4. Add motif features
-5. Evaluate interpretability + performance
+1. Baseline encoder + multi-view input
+2. Extract local embeddings
+3. Global clustering → prototypes
+4. Add soft assignment + motif features
+5. Evaluate clustering quality + interpretability
 
 ---
 
 ## Summary
 
-A hybrid system:
+A hybrid system where:
 
-* **encoder learns local acoustic structure**
-* **multi-view input exposes hidden signals**
-* **clustering discovers recurring motifs**
-* **classifier learns which motifs correspond to species**
+* encoder learns **local acoustic structure**
+* clustering discovers **global motifs**
+* soft assignment represents **mixtures of signals**
+* classifier maps motifs → species
 
-This directly supports:
+Goal:
 
-> identifying the **specific spectrogram patterns that are the animal**
+> identify and explain **which spectrogram patterns correspond to animals**, even under overlap
