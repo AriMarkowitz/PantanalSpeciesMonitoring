@@ -31,6 +31,8 @@ BIRDSET_CONFIG="${BIRDSET_CONFIG:-PER}"
 BIRDSET_SPLIT="${BIRDSET_SPLIT:-train}"
 BIRDSET_MAX_FILES="${BIRDSET_MAX_FILES:-3000}"
 BIRDSET_ALLOWLIST="${BIRDSET_ALLOWLIST:-}"
+BIRDSET_ISOLATED="${BIRDSET_ISOLATED:-1}"
+BIRDSET_VENV_DIR="${BIRDSET_VENV_DIR:-$PROJECT_DIR/.venv_birdset_scrape}"
 
 mkdir -p "$PROJECT_DIR/outputs/logs"
 
@@ -51,13 +53,31 @@ echo "Output dir: $OUTPUT_DIR"
 echo "Manifest: $MANIFEST_PATH"
 echo "iNat enabled: $INAT_ENABLE"
 echo "BirdSet enabled: $BIRDSET_ENABLE"
+echo "BirdSet isolated venv: $BIRDSET_ISOLATED"
 echo "---"
 
-# BirdSet path requires datasets package
+# BirdSet path requires datasets package.
+# To avoid dependency churn in the main conda env, use an isolated venv by default.
+INAT_PYTHON="python"
+BIRDSET_PYTHON="python"
+
 if [[ "$BIRDSET_ENABLE" == "1" ]]; then
-    if ! python -c "import datasets" >/dev/null 2>&1; then
-        echo "Installing required package for BirdSet: datasets<=3.6.0"
-        pip install "datasets<=3.6.0"
+    if [[ "$BIRDSET_ISOLATED" == "1" ]]; then
+        echo "Preparing isolated BirdSet venv: $BIRDSET_VENV_DIR"
+        if [[ ! -d "$BIRDSET_VENV_DIR" ]]; then
+            python -m venv "$BIRDSET_VENV_DIR"
+        fi
+        BIRDSET_PYTHON="$BIRDSET_VENV_DIR/bin/python"
+
+        if ! "$BIRDSET_PYTHON" -c "import datasets, soundfile, tqdm" >/dev/null 2>&1; then
+            "$BIRDSET_PYTHON" -m pip install --upgrade pip
+            "$BIRDSET_PYTHON" -m pip install "datasets<=3.6.0" soundfile tqdm
+        fi
+    else
+        if ! python -c "import datasets" >/dev/null 2>&1; then
+            echo "Installing required package for BirdSet in main env: datasets<=3.6.0"
+            pip install "datasets<=3.6.0"
+        fi
     fi
 fi
 
@@ -73,7 +93,7 @@ fi
 
 if [[ "$INAT_ENABLE" == "1" ]]; then
     echo "[1/2] Collecting iNat subset..."
-    python src/scrape_distill_data.py \
+    "$INAT_PYTHON" src/scrape_distill_data.py \
         --inat \
         --inat-max-files "$INAT_MAX_FILES" \
         --inat-splits "$INAT_SPLITS" \
@@ -95,7 +115,7 @@ if [[ "$BIRDSET_ENABLE" == "1" ]]; then
         BIRDSET_ARGS+=(--birdset-species-allowlist "$BIRDSET_ALLOWLIST")
     fi
 
-    python src/scrape_distill_data.py \
+    "$BIRDSET_PYTHON" src/scrape_distill_data.py \
         "${BIRDSET_ARGS[@]}" \
         "${COMMON_ARGS[@]}"
 fi
