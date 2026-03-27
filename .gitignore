@@ -1,0 +1,11 @@
+data/
+outputs/
+*.h5
+*.pkl
+*.npz
+__pycache__/
+*.pyc
+wandb/
+*.out
+logs/
+.DS_Store

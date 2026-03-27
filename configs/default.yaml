@@ -1,0 +1,68 @@
+data:
+  train_csv: data/train.csv
+  soundscape_labels_csv: data/train_soundscapes_labels.csv
+  taxonomy_csv: data/taxonomy.csv
+  train_audio_dir: data/train_audio
+  soundscape_dir: data/train_soundscapes
+  sample_rate: 32000
+  segment_duration: 5.0
+  segment_overlap: 0.0
+
+outputs:
+  base_dir: outputs
+  segments_csv: outputs/segments.csv
+  embeddings_h5: outputs/embeddings/embeddings.h5
+  prototypes_dir: outputs/prototypes
+  features_h5: outputs/features/features.h5
+  checkpoints_dir: outputs/checkpoints
+  pseudo_labels_dir: outputs/pseudo_labels
+  logs_dir: outputs/logs
+
+stage0:
+  energy_threshold: 0.001
+  min_active_fraction: 0.1
+  skip_silence_filter: false
+
+stage1:
+  model_name: perch_v2
+  batch_size: 64
+  num_workers: 8
+  store_spatial: true
+  store_logits: true
+  top_k_logits: 200
+  logits_dtype: float16
+
+stage2:
+  global:
+    umap_dim: 64
+    subsample_n: 200000
+    min_cluster_size: 50
+    min_samples: 10
+  species:
+    pca_dim: 64
+    max_components: 10
+    min_samples_per_component: 20
+
+stage3:
+  top_k_logits: 200
+  assignment_mode: soft
+
+stage4:
+  hidden_dims: [512, 256]
+  dropout: 0.3
+  lr: 1.0e-3
+  weight_decay: 1.0e-4
+  max_epochs: 50
+  batch_size: 512
+  n_folds: 5
+  loss: focal
+  focal_alpha: 0.25
+  focal_gamma: 2.0
+  wandb_project: pantanal-monitoring
+
+stage4b:
+  max_rounds: 3
+  initial_threshold: 0.9
+  self_train_threshold: 0.85
+  pseudo_weight: 0.5
+  use_perch_logits_round1: true

@@ -68,22 +68,38 @@ Recommended: HDBSCAN (density-based, handles noise) or k-means (simpler baseline
 
 ---
 
-### D. Soft Assignment (Key Update)
+### D. Motif Assignment Strategies (Key Update)
 
-Do **not** force one cluster per embedding.
+Do **not** force one cluster per embedding. Support multiple assignment modes:
 
-For each local embedding `z_t`, compute **soft weights** over prototypes:
+#### 1) Soft clustering (default)
 
 ```text
 w_t[k] = softmax(sim(z_t, p_k))
 ```
 
-Interpretation:
+* each embedding is a **mixture over motifs**
+* handles overlap (frog + insect)
 
-* allows **overlapping signals** (e.g., frog + insect)
-* `z_t` can be a **mixture of motifs**
+#### 2) Nearest‑k (sparse assignment)
 
-This is a neural analogue of **mixture decomposition** (NMF-like, but learned in embedding space).
+```text
+keep top-K clusters per z_t
+```
+
+* simpler, faster
+* interpretable: “these K motifs are active here”
+
+#### 3) Prototype decomposition (NMF-like)
+
+```text
+z_t ≈ Σ_k w_t[k] · p_k
+```
+
+* explicit **mixture of motifs**
+* best for explaining *why* patches are similar/different
+
+> These are interchangeable views over the same prototypes `P`.
 
 ---
 
@@ -135,8 +151,9 @@ Notes:
 ## 5. Key Ideas
 
 * **Local embeddings** capture structure in small spectrogram regions
-* **Clusters = motifs** discovered globally across data
-* **Soft assignment** allows **multiple signals per region**
+* **Clusters = prototypes (motifs)** discovered globally across data
+* **Assignment is flexible**: soft, nearest‑k, or full prototype decomposition
+* **Soft / sparse assignments** enable **multiple signals per region**
 * **Sequences of activations** recover variable-length events
 
 ---
