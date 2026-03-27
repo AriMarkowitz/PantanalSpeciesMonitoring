@@ -34,7 +34,7 @@ The README proposes building a custom local encoder with multi-view spectrograms
 
 - **Multi-view preprocessing (Section A)** → Perch uses PCEN internally, which handles background suppression. Custom multi-view channels are unnecessary for the encoder — Perch's training on millions of recordings already provides view invariance.
 - **Local encoder (Section B)** → Perch's **spatial embeddings `(5, 3, 1536)`** are exactly the local embedding grid `Z = {z_1, ..., z_T}` described in the README. Each of the 15 spatial positions represents a local time-frequency receptive field.
-- **Foundation model as teacher** → We skip this. Perch IS the foundation model. No distillation needed.
+- **Foundation model as teacher** → Perch is the teacher model for representation learning, but we still distill a lightweight student embedder for deployment-constrained inference.
 
 ### 1.3 What Perch Does NOT Replace
 
@@ -47,12 +47,17 @@ The README proposes building a custom local encoder with multi-view spectrograms
 
 | Phase | Hardware | Rationale |
 |-------|----------|-----------|
-| Embedding extraction | **GPU** (L40S) | Batch-process all audio through Perch 2.0. One-time cost. |
+| Teacher embedding extraction | **GPU** (L40S) | Batch-process all audio through Perch 2.0. One-time cost. |
+| Student distillation training | **GPU** (L40S) | Train a fast PyTorch embedder to match Perch embeddings on diverse audio. |
 | Clustering | **CPU** | HDBSCAN/k-means on extracted embeddings. Memory-bound, not GPU-bound. |
 | Classifier training | **GPU** (L40S) | Train MLP head on embeddings + motif features. Fast. |
-| Inference (deployment) | **CPU** | Perch 2.0 CPU release (Kaggle) + precomputed prototypes + lightweight classifier. |
+| Inference (deployment) | **CPU** | Use distilled student embeddings + precomputed prototypes + lightweight classifier. |
 
-**CPU inference**: Perch 2.0 now has an official CPU release on Kaggle, so TFLite conversion is no longer required for deployment. Install with `tensorflow-cpu` instead of `tensorflow[and-cuda]`. This also means we can run inference on Easley CPU partitions without GPU allocation.
+**Why distillation is required for viable inference**: raw Perch CPU inference is near the BirdCLEF notebook time budget (~90 min) by itself, leaving little/no time for feature post-processing, classifier inference, I/O overhead, and safety margin. Distillation moves heavy Perch compute offline (HPC/GPU) and keeps deployment-time inference fast and predictable on CPU.
+
+**Why add more external data before distillation**: the student only generalizes to acoustic conditions seen during teacher-student training. Adding tropical/soundscape-heavy audio (BirdCLEF unlabeled soundscapes + filtered iNat/BirdSet subsets) improves robustness to domain shift in noisy, polyphonic recordings.
+
+**Deduplication is mandatory**: cross-source duplication (e.g., iNaturalist overlap across datasets) can leak near-identical clips into multiple splits, distort metrics, and waste storage/compute. We deduplicate by source ID, filename keys, and content hash.
 
 ---
 
@@ -69,6 +74,19 @@ The README proposes building a custom local encoder with multi-view spectrograms
 │                            → global embeddings (1536,)           │
 │                            → logits (15K classes)                │
 │   Output: HDF5 embedding database                                │
+├──────────────────────────────────────────────────────────────────┤
+│ STAGE 1b: External Data Expansion + Dedup  [CPU+I/O]             │
+│   filtered BirdSet/iNat subsets + unlabeled soundscapes          │
+│   → dedup by IDs/filenames/content hash                           │
+│   Output: distillation manifest + expanded clean corpus           │
+├──────────────────────────────────────────────────────────────────┤
+│ STAGE 1c: Embed Expanded Corpus with Perch (Teacher) [GPU]        │
+│   expanded audio → Perch embeddings/logits                         │
+│   Output: teacher targets for distillation                         │
+├──────────────────────────────────────────────────────────────────┤
+│ STAGE 1d: Distill Student Embedder  [GPU]                         │
+│   student(audio) ≈ Perch(audio) in embedding space                │
+│   Output: CPU-fast student embedder                                │
 ├──────────────────────────────────────────────────────────────────┤
 │ STAGE 2: Motif Discovery  [CPU]                                  │
 │   all spatial embeddings → HDBSCAN → prototypes P = {p_1..p_K}   │
@@ -91,7 +109,7 @@ The README proposes building a custom local encoder with multi-view spectrograms
 │   Output: final classifier weights + pseudo-label set            │
 ├──────────────────────────────────────────────────────────────────┤
 │ STAGE 5: Inference / Deployment  [CPU]                           │
-│   new audio → Perch CPU → embeddings → assign to prototypes      │
+│   new audio → distilled student → embeddings → assign prototypes │
 │   → motif features → classifier → species predictions            │
 └──────────────────────────────────────────────────────────────────┘
 ```
@@ -117,11 +135,13 @@ The README proposes building a custom local encoder with multi-view spectrograms
 
 **Tasks**:
 1. Inventory all audio files from both sources, validate formats (WAV/FLAC/MP3)
-2. Resample to 32 kHz mono (Perch requirement)
-3. Segment into 5-second non-overlapping windows (with optional 2.5s overlap for denser coverage)
-4. Filter out silence/low-energy segments (simple energy threshold or Perch's own VAD via logits)
-5. Build metadata CSV: `file_id, segment_id, start_time, end_time, path, source_type, primary_label, secondary_labels, is_labeled`
-6. Track provenance: keep XC/iNat and soundscape data identifiable throughout the pipeline
+2. Ingest external subsets for distillation (filtered iNat/BirdSet + prior soundscapes)
+3. Deduplicate globally (source IDs, filename keys, content hashes)
+4. Resample to 32 kHz mono (Perch requirement)
+5. Segment into 5-second non-overlapping windows (with optional 2.5s overlap for denser coverage)
+6. Filter out silence/low-energy segments (simple energy threshold or Perch's own VAD via logits)
+7. Build metadata CSV: `file_id, segment_id, start_time, end_time, path, source_type, primary_label, secondary_labels, is_labeled`
+8. Track provenance: keep XC/iNat/BirdSet/soundscape data identifiable throughout the pipeline
 
 **Output**: Directory of 5s WAV segments + metadata CSV with source and label provenance
 
@@ -732,6 +752,48 @@ PantanalSpeciesMonitoring/
 | XC/iNat domain shift to soundscapes | High | High | Pseudo-labeling on in-domain unlabeled soundscapes bridges the gap; masked loss avoids false negatives from incomplete XC secondary labels |
 | Pantanal species not in Perch's 15K taxonomy | Low | Medium | Embeddings still transfer well to unseen species (demonstrated for marine mammals); clustering handles novel species |
 | CPU Perch release missing spatial embeddings | Low | Medium | Verify spatial output parity with GPU variant early; fallback to global embeddings only if needed |
+
+---
+
+## 10. Supplemental Ideas / Future Directions
+
+### A. End-to-End Differentiable Clustering
+
+The core pipeline treats clustering as a frozen preprocessing step — HDBSCAN discovers prototypes offline, then the classifier uses them as fixed features. This leaves performance on the table because the prototypes are not optimized for classification.
+
+**The problem**: HDBSCAN/GMM hyperparameters (min_cluster_size, number of components) are discrete or non-differentiable, so classification loss can't directly flow back through them.
+
+**Approaches, in order of practicality:**
+
+#### 1) Learnable prototypes + temperature (recommended first step)
+Initialize prototypes `P` from HDBSCAN medoids, then make them `nn.Parameter`. The soft assignment is already differentiable:
+```
+w_t[k] = softmax(-||z_t - p_k||^2 / τ_k)  →  motif features  →  classifier  →  loss
+```
+Gradients from classification loss flow back to both `P` (prototype positions) and per-prototype `τ_k` (assignment sharpness). This is essentially a prototypical network initialized from unsupervised clustering.
+
+- Tight clusters (e.g., a specific bird call) will learn low `τ_k` (sharp assignment)
+- Diffuse clusters (e.g., background noise) will learn high `τ_k` (soft assignment)
+- Dead prototypes (never activated) can be pruned during training
+
+#### 2) Gumbel-Softmax for hard-ish assignments
+If interpretability requires near-discrete assignment (e.g., "this segment activates motifs 3, 17, and 42"), use Gumbel-Softmax with temperature annealing. Start soft for gradient flow, anneal toward hard for inference. Compatible with approach (1).
+
+#### 3) Bayesian hyperparameter optimization (outer loop)
+Treat HDBSCAN hyperparameters (min_cluster_size, min_samples, UMAP dim) as outer-loop variables optimized via Optuna or similar. Inner loop: cluster → build features → train classifier → val AUC. Not true backprop, but achieves the same goal. Expensive (full retrain per trial) but embarrassingly parallel across Slurm jobs.
+
+#### 4) Full joint deep clustering (most ambitious)
+Merge Stages 2–4 into a single end-to-end model:
+```
+Perch embeddings → learned prototypes (nn.Parameter) → soft assign → features → classifier
+                          ↑                                                         |
+                          └──────────── gradient from classification loss ───────────┘
+```
+K (number of prototypes) is fixed per run but can be set high and pruned. HDBSCAN provides initialization only. This is a research direction — worth exploring after the baseline pipeline is validated.
+
+**Recommendation**: Implement (1) as a Stage 4 variant after the frozen-prototype baseline is working. If val AUC improves, adopt it. Use (3) to tune HDBSCAN hyperparameters regardless. Defer (4) unless (1) shows large gains, suggesting the prototype positions matter a lot.
+
+**Note**: Within-species GMMs should stay frozen — they serve interpretability and the global motif features already carry most classification signal.
 
 ---
 
