@@ -12,13 +12,13 @@ Primary source support:
 
 Examples:
   # iNat only, Pantanal-ish bbox, frogs+insects+mammals+reptiles + tropical birds
-  python src/scrape_distill_data.py \
+    python src/scrape_distill_data.py \
     --output-dir data/distill_audio \
     --manifest-path data/distill_manifest.csv \
     --inat \
     --inat-max-files 8000 \
     --inat-supercategories aves,amphibia,insecta,mammalia,reptilia \
-    --bbox -25,-60,-10,-45 \
+        --bbox=-25,-60,-10,-45 \
     --skip-existing
 
   # Add BirdSet PER subset (requires: pip install datasets)
@@ -480,7 +480,12 @@ def build_parser() -> argparse.ArgumentParser:
         default="aves,amphibia,insecta,mammalia,reptilia",
         help="Comma list of supercategories to keep",
     )
-    p.add_argument("--bbox", type=str, default="", help="min_lat,min_lon,max_lat,max_lon")
+    p.add_argument(
+        "--bbox",
+        type=str,
+        default="",
+        help="min_lat,min_lon,max_lat,max_lon (use --bbox=-25,-60,-10,-45 for negative coords)",
+    )
     p.add_argument("--inat-min-duration", type=float, default=2.0)
 
     p.add_argument("--birdset", action="store_true", help="Enable BirdSet collection")

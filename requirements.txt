@@ -9,3 +9,4 @@ umap-learn>=0.5
 pyyaml>=6.0
 tqdm>=4.65
 wandb>=0.15
+datasets<=3.6.0
