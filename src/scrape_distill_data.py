@@ -588,10 +588,26 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--inat-min-duration", type=float, default=2.0)
 
     p.add_argument("--birdset", action="store_true", help="Enable BirdSet collection")
-    p.add_argument("--birdset-config", type=str, default="PER", help="HF BirdSet config name, e.g. PER")
+    p.add_argument(
+        "--birdset-configs",
+        type=str,
+        default="PER",
+        help="Comma-separated BirdSet config names, e.g. PER,NES",
+    )
     p.add_argument("--birdset-split", type=str, default="train")
-    p.add_argument("--birdset-max-files", type=int, default=3000)
+    p.add_argument("--birdset-max-files", type=int, default=3000, help="Max files per config")
     p.add_argument("--birdset-species-allowlist", type=str, default="")
+    p.add_argument(
+        "--taxonomy-cache-dir",
+        type=str,
+        default="data/taxonomy_cache",
+        help="Directory to cache downloaded eBird taxonomy CSV",
+    )
+    p.add_argument(
+        "--repair-manifest",
+        action="store_true",
+        help="Retroactively fix integer ebird_code labels in existing BirdSet manifest rows",
+    )
     return p
 
 
