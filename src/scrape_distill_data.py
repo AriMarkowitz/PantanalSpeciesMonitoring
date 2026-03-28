@@ -37,6 +37,7 @@ import io
 import json
 import logging
 import os
+import shutil
 import tarfile
 import tempfile
 import urllib.request
@@ -47,6 +48,11 @@ from typing import Any
 import soundfile as sf
 from tqdm import tqdm
 
+
+EBIRD_TAXONOMY_URL = (
+    "https://www.birds.cornell.edu/clementschecklist/wp-content/uploads/2024/10/"
+    "eBird_taxonomy_v2024.csv"
+)
 
 INAT_BASE = "https://ml-inat-competition-datasets.s3.amazonaws.com/sounds/2024"
 INAT_AUDIO_URLS = {
@@ -202,6 +208,57 @@ def _safe_float(x: Any):
         return ""
 
 
+def load_ebird_taxonomy(cache_dir: Path, logger: logging.Logger) -> dict[str, dict[str, str]]:
+    """Download (once) and parse the eBird taxonomy CSV.
+
+    Returns a dict: ebird_code (lowercase 6-letter) -> {"scientific_name": ..., "common_name": ...}
+    """
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_path = cache_dir / "ebird_taxonomy_v2024.csv"
+
+    if not cache_path.exists():
+        logger.info(f"Downloading eBird taxonomy → {cache_path}")
+        data = _download_small_file(EBIRD_TAXONOMY_URL)
+        cache_path.write_bytes(data)
+    else:
+        logger.info(f"Using cached eBird taxonomy: {cache_path}")
+
+    mapping: dict[str, dict[str, str]] = {}
+    with cache_path.open("r", encoding="utf-8-sig", newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            # Column names vary slightly between versions; try both
+            code = (row.get("species_code") or row.get("SPECIES_CODE") or "").strip().lower()
+            sci = (row.get("SCI_NAME") or row.get("sci_name") or row.get("SCIENTIFIC NAME") or "").strip()
+            common = (row.get("PRIMARY_COM_NAME") or row.get("primary_com_name") or row.get("COMMON NAME") or "").strip()
+            if code:
+                mapping[code] = {"scientific_name": sci, "common_name": common}
+
+    logger.info(f"Loaded eBird taxonomy: {len(mapping)} species")
+    return mapping
+
+
+def build_birdset_label_map(config_name: str, split: str, logger: logging.Logger) -> dict[int, str]:
+    """Return {int_index: ebird_code_string} for a BirdSet config using its ClassLabel feature."""
+    try:
+        from datasets import load_dataset_builder
+    except ImportError:
+        return {}
+
+    try:
+        builder = load_dataset_builder("DBD-research-group/BirdSet", config_name, trust_remote_code=True)
+        builder.download_and_prepare()
+        features = builder.info.features
+        ebird_feature = features.get("ebird_code")
+        if ebird_feature is not None and hasattr(ebird_feature, "names"):
+            result = {i: name for i, name in enumerate(ebird_feature.names)}
+            logger.info(f"BirdSet {config_name} label map: {len(result)} classes")
+            return result
+    except Exception as e:
+        logger.warning(f"Could not load BirdSet label map for {config_name}: {e}")
+    return {}
+
+
 def collect_inat(
     output_dir: Path,
     manifest_path: Path,
@@ -258,7 +315,7 @@ def collect_inat(
                 if source_id in dedup.source_ids or basename in dedup.basenames:
                     continue
 
-            target_by_split[split][f"{split}/{file_name}"] = {
+            target_by_split[split][file_name] = {
                 "source": "inat",
                 "source_split": split,
                 "source_id": source_id,
@@ -330,7 +387,7 @@ def collect_inat(
                             pbar.update(1)
                             continue
 
-                        os.replace(tmp_path, out_path)
+                        shutil.move(str(tmp_path), str(out_path))
                         info = sf.info(str(out_path))
 
                         rel_out = out_path.relative_to(output_dir)
@@ -375,11 +432,12 @@ def collect_birdset(
     split: str,
     max_files: int,
     species_allowlist_path: Path | None,
+    ebird_taxonomy: dict[str, dict[str, str]],
     skip_existing: bool,
     logger: logging.Logger,
 ):
     try:
-        from datasets import Audio, load_dataset
+        from datasets import load_dataset
     except Exception as e:
         logger.error(
             "BirdSet requested but Hugging Face datasets package is unavailable. "
@@ -399,39 +457,80 @@ def collect_birdset(
         }
         logger.info(f"Loaded BirdSet species allowlist: {len(allowlist)} entries")
 
+    # Build int→ebird_code map from the dataset's ClassLabel feature
+    int2ebird = build_birdset_label_map(config_name, split, logger)
+
     logger.info(f"Loading BirdSet dataset stream: config={config_name}, split={split}")
-    ds = load_dataset("DBD-research-group/BirdSet", config_name, split=split, streaming=True)
-    ds = ds.cast_column("audio", Audio(sampling_rate=32000, decode=True))
+    # Load raw — do NOT use cast_column/Audio decode; it silently returns array=None
+    # when librosa resampling fails in the isolated venv. We decode bytes ourselves.
+    ds = load_dataset("DBD-research-group/BirdSet", config_name, split=split, streaming=True, trust_remote_code=True)
 
     new_rows: list[dict[str, Any]] = []
     count = 0
+    target_sr = 32000
 
     for ex in tqdm(ds, total=max_files, desc=f"birdset-{config_name}-{split}"):
         if count >= max_files:
             break
 
-        audio = ex.get("audio")
-        if not isinstance(audio, dict) or "array" not in audio:
+        audio_field = ex.get("audio")
+        if not isinstance(audio_field, dict):
+            continue
+        raw_bytes = audio_field.get("bytes")
+        if not raw_bytes:
             continue
 
-        ebird = ex.get("ebird_code")
+        # Resolve ebird_code: may be int index or string depending on HF version
+        raw_ebird = ex.get("ebird_code")
+        if isinstance(raw_ebird, int) and int2ebird:
+            ebird_code = int2ebird.get(raw_ebird, "")
+        else:
+            ebird_code = str(raw_ebird or "").lower()
+
         if allowlist is not None:
-            if ebird is None or str(ebird) not in allowlist:
+            if not ebird_code or ebird_code not in allowlist:
                 continue
 
-        source_path = str(audio.get("path", ""))
-        source_id = f"birdset:{config_name}:{split}:{source_path or count}"
-        basename = Path(source_path).name if source_path else f"sample_{count}.wav"
-        out_name = f"{source_id.replace(':', '_')}_{basename if basename.endswith('.wav') else basename + '.wav'}"
+        # Look up scientific name and common name from eBird taxonomy
+        tax = ebird_taxonomy.get(ebird_code, {})
+        scientific_name = tax.get("scientific_name", "")
+        common_name = tax.get("common_name", "")
+
+        # Decode bytes → numpy array via soundfile
+        try:
+            arr, sr = sf.read(io.BytesIO(raw_bytes), dtype="float32", always_2d=False)
+        except Exception as e:
+            logger.warning(f"soundfile decode failed for example {count}: {e}")
+            continue
+        if arr.ndim > 1:
+            arr = arr.mean(axis=1)
+
+        # Resample to 32kHz if needed
+        if sr != target_sr:
+            try:
+                import resampy
+                arr = resampy.resample(arr, sr, target_sr)
+            except ImportError:
+                from scipy.signal import resample_poly
+                import math
+                g = math.gcd(target_sr, sr)
+                arr = resample_poly(arr, target_sr // g, sr // g).astype("float32")
+            sr = target_sr
+
+        # Read lat/lon — BirdSet exposes these in streaming mode
+        lat = _safe_float(ex.get("lat") or ex.get("latitude"))
+        lon = _safe_float(ex.get("long") or ex.get("longitude"))
+
+        filepath = str(ex.get("filepath", ""))
+        source_id = f"birdset:{config_name}:{split}:{filepath or count}"
+        basename = Path(filepath).stem if filepath else f"sample_{count}"
+        out_name = f"birdset_{config_name}_{split}_{basename}.wav"
 
         out_path = output_base / config_name / split / out_name
         out_path.parent.mkdir(parents=True, exist_ok=True)
 
         if skip_existing and (source_id in dedup.source_ids or out_path.name in dedup.basenames):
             continue
-
-        arr = audio["array"]
-        sr = int(audio.get("sampling_rate", 32000))
         sf.write(str(out_path), arr, sr)
         sha1 = _sha1_path(out_path)
 
@@ -444,11 +543,11 @@ def collect_birdset(
             "source": "birdset",
             "source_split": split,
             "source_id": source_id,
-            "species_name": str(ebird or ""),
-            "common_name": "",
+            "species_name": scientific_name or ebird_code,
+            "common_name": common_name,
             "supercategory": "aves",
-            "latitude": "",
-            "longitude": "",
+            "latitude": lat,
+            "longitude": lon,
             "duration_sec": float(len(arr) / sr) if sr > 0 else "",
             "sample_rate": sr,
             "relative_path": str(rel_out),

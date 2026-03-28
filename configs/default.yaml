@@ -4,6 +4,8 @@ data:
   taxonomy_csv: data/taxonomy.csv
   train_audio_dir: data/train_audio
   soundscape_dir: data/train_soundscapes
+  distill_manifest_csv: data/distill_manifest.csv
+  distill_audio_dir: data/distill_audio
   sample_rate: 32000
   segment_duration: 5.0
   segment_overlap: 0.0
@@ -11,7 +13,9 @@ data:
 outputs:
   base_dir: outputs
   segments_csv: outputs/segments.csv
+  distill_segments_csv: outputs/distill_segments.csv
   embeddings_h5: outputs/embeddings/embeddings.h5
+  distill_embeddings_h5: outputs/embeddings/distill_embeddings.h5
   prototypes_dir: outputs/prototypes
   features_h5: outputs/features/features.h5
   checkpoints_dir: outputs/checkpoints
@@ -46,6 +50,8 @@ stage2:
 stage3:
   top_k_logits: 200
   assignment_mode: soft
+  similarity_metric: cosine    # "cosine" (default, better for Perch) or "euclidean"
+  temperature: 0.1             # softmax temperature — lower = sharper assignment
 
 stage4:
   hidden_dims: [512, 256]
@@ -59,6 +65,28 @@ stage4:
   focal_alpha: 0.25
   focal_gamma: 2.0
   wandb_project: pantanal-monitoring
+
+stage1d:
+  backbone: DBD-research-group/EfficientNet-B1-BirdSet-XCL
+  embed_dim: 1536
+  epochs: 25
+  batch_size: 64
+  num_workers: 4
+  backbone_lr: 1.0e-5      # lower lr for pretrained backbone
+  head_lr: 1.0e-4          # higher lr for projection heads
+  weight_decay: 1.0e-4
+  lambda_global: 1.0
+  lambda_spatial: 1.0
+  lambda_logit: 0.15
+  target_cosine_sim: 0.85  # log when this threshold is reached
+  wandb_project: pantanal-monitoring
+
+student_mel:
+  n_mels: 128
+  hop_ms: 10               # hop length in milliseconds (matches Perch frontend)
+  win_ms: 25               # window length in milliseconds
+  fmin: 60.0
+  fmax: 16000.0
 
 stage4b:
   max_rounds: 3

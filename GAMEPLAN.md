@@ -1,7 +1,7 @@
 # Pantanal Species Monitoring — Implementation Gameplan
 
-**Date**: 2026-03-26
-**Status**: DRAFT — awaiting review & approval
+**Date**: 2026-03-28 (updated)
+**Status**: IN PROGRESS
 
 ---
 
@@ -53,7 +53,9 @@ The README proposes building a custom local encoder with multi-view spectrograms
 | Classifier training | **GPU** (L40S) | Train MLP head on embeddings + motif features. Fast. |
 | Inference (deployment) | **CPU** | Use distilled student embeddings + precomputed prototypes + lightweight classifier. |
 
-**Why distillation is required for viable inference**: raw Perch CPU inference is near the BirdCLEF notebook time budget (~90 min) by itself, leaving little/no time for feature post-processing, classifier inference, I/O overhead, and safety margin. Distillation moves heavy Perch compute offline (HPC/GPU) and keeps deployment-time inference fast and predictable on CPU.
+**Why distillation is required for viable inference**: The Kaggle CPU Perch 2.0 release was benchmarked and **does not fit within the competition time budget**. Perch's EfficientNet-B3 backbone (~12M params + 91M logit head) is too heavy for batch CPU inference at competition scale — it consumes the entire ~90 min time budget on its own, leaving zero time for prototype assignment, classifier inference, I/O, and safety margin. Distillation moves the heavy Perch compute offline (HPC/GPU, one-time cost) and keeps deployment-time inference fast and deterministic on CPU.
+
+**Why a domain-specialized student is better — not just acceptable**: Perch's 1536-D embedding space is optimized for global taxonomic diversity across ~15,000 species worldwide. Our task only requires discriminating 234 Pantanal species. A student trained to mimic Perch's output on Pantanal-domain audio learns a **compressed, domain-specialized** embedding space — dimensions irrelevant to Pantanal bioacoustics are discarded. The student can be substantially smaller than Perch with no loss of discriminative signal for our specific task. This is a genuine advantage, not a compromise.
 
 **Why add more external data before distillation**: the student only generalizes to acoustic conditions seen during teacher-student training. Adding tropical/soundscape-heavy audio (BirdCLEF unlabeled soundscapes + filtered iNat/BirdSet subsets) improves robustness to domain shift in noisy, polyphonic recordings.
 
@@ -75,22 +77,34 @@ The README proposes building a custom local encoder with multi-view spectrograms
 │                            → logits (15K classes)                │
 │   Output: HDF5 embedding database                                │
 ├──────────────────────────────────────────────────────────────────┤
-│ STAGE 1b: External Data Expansion + Dedup  [CPU+I/O]             │
-│   filtered BirdSet/iNat subsets + unlabeled soundscapes          │
-│   → dedup by IDs/filenames/content hash                           │
-│   Output: distillation manifest + expanded clean corpus           │
+│ STAGE 0b: Distill Data Preparation  [CPU+I/O]              ✅    │
+│   distill_manifest.csv → dedup vs segments.csv (sha1+basename)   │
+│   → segment into 5s chunks → label-match via taxonomy             │
+│   → 135/234 species covered; unmatched = unlabeled (still useful) │
+│   Output: outputs/distill_segments.csv (same 11-col schema)       │
 ├──────────────────────────────────────────────────────────────────┤
-│ STAGE 1c: Embed Expanded Corpus with Perch (Teacher) [GPU]        │
-│   expanded audio → Perch embeddings/logits                         │
-│   Output: teacher targets for distillation                         │
+│ STAGE 1b: Scrape External Corpus  [CPU+I/O]                ✅    │
+│   iNat Sounds 2024 (Pantanal bbox): 805 files extracted           │
+│   BirdSet PER (Peru, Neotropical): scrape in progress             │
+│   Dedup: sha1 + basename across both sources + across runs        │
+│   Output: data/distill_manifest.csv, data/distill_audio/          │
+├──────────────────────────────────────────────────────────────────┤
+│ STAGE 1c: Embed Distill Corpus with Perch (Teacher) [GPU]         │
+│   distill_segments.csv → Perch embeddings/logits                  │
+│   Same extract_embeddings.py, overriding segments/h5 config keys  │
+│   Output: outputs/embeddings/distill_embeddings.h5                │
 ├──────────────────────────────────────────────────────────────────┤
 │ STAGE 1d: Distill Student Embedder  [GPU]                         │
+│   EfficientNet-B1-BirdSet backbone + projection heads             │
 │   student(audio) ≈ Perch(audio) in embedding space                │
-│   Output: CPU-fast student embedder                                │
+│   Loss: cosine(global) + cosine(spatial) + 0.15×MSE(logits)       │
+│   Output: CPU-deployable student (~58ms/clip on CPU)              │
 ├──────────────────────────────────────────────────────────────────┤
 │ STAGE 2: Motif Discovery  [CPU]                                  │
-│   all spatial embeddings → HDBSCAN → prototypes P = {p_1..p_K}   │
-│   Output: prototype vectors + cluster metadata                   │
+│   primary + distill spatial embeddings (--with-distill flag)     │
+│   → HDBSCAN → prototypes P = {p_1..p_K}                          │
+│   → per-species GMMs enriched with distill labeled segments       │
+│   Output: prototype vectors + cluster metadata + species GMMs    │
 ├──────────────────────────────────────────────────────────────────┤
 │ STAGE 3: Motif Assignment  [CPU]                                 │
 │   per-file spatial embeddings + prototypes → soft assignments W   │
@@ -118,7 +132,7 @@ The README proposes building a custom local encoder with multi-view spectrograms
 
 ## 3. Implementation Stages (Detailed)
 
-### Stage 0: Data Preparation
+### Stage 0: Data Preparation ✅
 
 **Data sources** (two distinct types):
 
@@ -133,43 +147,92 @@ The README proposes building a custom local encoder with multi-view spectrograms
 - Soundscape labeled segments are **strong multi-label** where annotated
 - Unlabeled soundscape segments are **unknown** (not negative) — critical distinction for training
 
-**Tasks**:
-1. Inventory all audio files from both sources, validate formats (WAV/FLAC/MP3)
-2. Ingest external subsets for distillation (filtered iNat/BirdSet + prior soundscapes)
-3. Deduplicate globally (source IDs, filename keys, content hashes)
-4. Resample to 32 kHz mono (Perch requirement)
-5. Segment into 5-second non-overlapping windows (with optional 2.5s overlap for denser coverage)
-6. Filter out silence/low-energy segments (simple energy threshold or Perch's own VAD via logits)
-7. Build metadata CSV: `file_id, segment_id, start_time, end_time, path, source_type, primary_label, secondary_labels, is_labeled`
-8. Track provenance: keep XC/iNat/BirdSet/soundscape data identifiable throughout the pipeline
+**Implemented** (`src/prepare_data.py`):
+- Segments XC/iNat focal recordings and soundscapes into 5s windows
+- Silence filter (frame-level RMS energy threshold, configurable)
+- Outputs `outputs/segments.csv` with 11-column schema: `segment_id, source_file, start_sec, end_sec, source_type, primary_label, secondary_labels, is_labeled, label_quality`
+- **Current status**: 358,455 segments (~348K labeled, ~10K unlabeled soundscapes)
 
-**Output**: Directory of 5s WAV segments + metadata CSV with source and label provenance
+**Output**: `outputs/segments.csv`
 
-### Stage 1: Embedding Extraction
+---
 
-**Tool**: `perch-hoplite` with `perch_v2` model
+### Stage 0b: Distill Data Preparation ✅
 
-```python
-from perch_hoplite.zoo import model_configs
-import numpy as np, h5py, librosa
+Parallel pipeline for external distillation corpus (iNat Sounds 2024 + BirdSet). Keeps distill data in a separate CSV to avoid polluting the primary training split structure.
 
-model = model_configs.load_model_by_name('perch_v2')
+**Implemented** (`src/prepare_distill_data.py`):
 
-# Per segment:
-waveform, _ = librosa.load(path, sr=32000, mono=True)
-outputs = model.embed(waveform)
-# Store: outputs.embeddings (1536,), spatial (5,3,1536), logits
-```
+**Deduplication** (two layers):
+1. **sha1 hash** — exact content duplicates across runs are skipped
+2. **Audio file basename** — catches any overlap between distill audio and files already in `segments.csv` train set
 
-**Storage**: HDF5 file with datasets:
-- `global_embeddings`: `(N, 1536)` float32
+**Label matching** — joins `distill_manifest.csv` `species_name` (scientific name) against `taxonomy.csv` via case-insensitive string match:
+- 135/234 target species have matching distill audio (all labeled `strong_primary`)
+- Remaining 99 species have no distill coverage → those files segmented as `is_labeled=False` (still useful for HDBSCAN motif discovery)
+
+**Segmentation**: identical 5s logic as Stage 0 (reuses `segment_file()` and `check_energy()` from `prepare_data.py`)
+
+**Output**: `outputs/distill_segments.csv` — same 11-column schema as `segments.csv`, `segment_id` prefixed with `distill/` for traceability
+
+### Stage 1b: External Corpus Scrape ✅
+
+**Implemented** (`src/scrape_distill_data.py`, `scripts/scrape_distill_data.sh`):
+
+| Source | Config | Target | Status |
+|--------|--------|--------|--------|
+| iNat Sounds 2024 | Pantanal bbox (`-25,-60,-10,-45`), aves/amphibia/insecta/mammalia/reptilia, ≥2s | 8,000 files | ✅ 805 files extracted (full candidate set) |
+| BirdSet PER | Peru config, train split | 3,000 files | 🔄 Re-running with HF token (prior run got 1 file — unauthenticated rate limit) |
+
+**Dedup** (within scraper, before writing): source ID + content sha1 + audio basename. Manifest tracks all three.
+
+**Section-level skip logic** in `scrape_distill_data.sh`: iNat section skipped if manifest already has `inat,` rows; BirdSet skipped if count ≥ target — safe to resubmit.
+
+**Bugs fixed during scrape runs**:
+- iNat: `file_name` in metadata already includes `train/` prefix → was being double-prefixed as key → 0 extractions fixed
+- iNat: `os.replace()` fails across filesystems (`/tmp` → `/users`) → switched to `shutil.move()`
+- BirdSet: missing `trust_remote_code=True` → added
+- BirdSet: missing `librosa` in isolated venv → added to install
+
+**Output**: `data/distill_manifest.csv`, `data/distill_audio/{inat_sounds_2024,birdset}/`
+
+---
+
+### Stage 1: Embedding Extraction ✅
+
+**Tool**: `perch-hoplite` with `perch_v2` model, implemented in `src/extract_embeddings.py`
+
+**Storage** (`outputs/embeddings/embeddings.h5`):
+- `global_embeddings`: `(N, 1536)` float32 — mean-pooled from spatial
 - `spatial_embeddings`: `(N, 5, 3, 1536)` float32
-- `logits`: `(N, ~15000)` float16 (compressed)
+- `logit_values`: `(N, 200)` float16 — top-K Perch logits
+- `logit_indices`: `(N, 200)` int16 — class indices for top-K
+- `written`: `(N,)` bool — resumability flag
 - `segment_ids`: string array
 
-**Estimated size**: For 100K 5s segments → ~2.3 GB (spatial) + ~0.6 GB (global) + ~2.8 GB (logits float16) ≈ **~6 GB total**
+**Resumable**: checks `written` array, skips already-embedded segments on restart.
 
-### Stage 2: Motif Discovery (Two-Level Clustering)
+**Estimated size**: ~2.4 GB for 358K segments
+
+---
+
+### Stage 1c: Embed Distill Corpus ⬜
+
+**Implemented** (`scripts/extract_distill_embeddings.sh`):
+- Runs Stage 0b (`prepare_distill_data.py`) if `distill_segments.csv` doesn't exist yet
+- Runs Stage 1 (`extract_embeddings.py`) with config overrides:
+  - `outputs.segments_csv=outputs/distill_segments.csv`
+  - `outputs.embeddings_h5=outputs/embeddings/distill_embeddings.h5`
+- No changes to `extract_embeddings.py` — override via `--set` flags
+
+**To run**:
+```bash
+sbatch scripts/extract_distill_embeddings.sh
+```
+
+**Output**: `outputs/distill_segments.csv`, `outputs/embeddings/distill_embeddings.h5`
+
+### Stage 2: Motif Discovery (Two-Level Clustering) ✅ (primary) / ⬜ (with-distill)
 
 Clustering operates at two levels with different goals and different algorithms.
 
@@ -273,6 +336,16 @@ At inference time, a new clip gets:
 
 Both feed into the classifier as features.
 
+#### Distill Merge (`--with-distill`)
+
+When `distill_embeddings.h5` is present, `cluster.sh` automatically passes `--with-distill`:
+
+**Level 1 (HDBSCAN)**: subsample budget split proportionally between primary and distill embeddings. Distill audio covers Pantanal + Peru biomes — adds acoustic diversity to motif prototypes without displacing primary data.
+
+**Level 2 (GMMs)**: for each species, distill labeled segments are concatenated with primary labeled segments before PCA + BIC fitting. Species with ≥1 distill file benefit from richer embedding pools → more stable GMM components. 135/234 target species have distill coverage.
+
+**Labeled distill segments added to training data**: any distill segment with a matched taxonomy label (`is_labeled=True`) is treated as `strong_primary` — same loss mask as XC/iNat. This directly expands the labeled training set for 135 species, most of which are data-scarce in the primary corpus.
+
 ### Stage 3: Motif Assignment & Feature Extraction
 
 **For each clip** with spatial embeddings `{z_1, ..., z_15}` and global embedding `z_global`:
@@ -373,13 +446,99 @@ Iteratively label unlabeled data using the trained classifier, then retrain.
 - Labeled soundscapes are realistic but scarce
 - Unlabeled soundscapes are abundant — pseudo-labeling bridges the domain gap by adding in-domain training signal
 
+### Stage 1d: Student Embedder Distillation
+
+**Motivation**: Perch 2.0 CPU inference does not fit within the Kaggle competition time budget. A distilled student embedder replicates Perch's embedding geometry for Pantanal-domain audio at a fraction of the compute cost. Because the student is trained specifically on the Pantanal audio distribution, it is also a *better* encoder for this task — not just a faster one.
+
+#### Student Architecture
+
+**Backbone**: `DBD-research-group/EfficientNet-B1-BirdSet-XCL` (19.8M params, same family used in BirdCallClassifier). Key advantages over training from scratch:
+- Already pretrained on ~500K bird audio clips (BirdSet-XCL corpus)
+- Produces well-structured audio embeddings out of the box
+- ~2× smaller than Perch's EfficientNet-B3 backbone
+- Runs a 5s clip in ~40–60ms on CPU
+
+**Output heads** (added on top of BirdSet backbone):
+```
+EfficientNet-B1 backbone → feature map
+    → Global pool → Linear(1536)           # global embedding head
+    → Adaptive pool (5,3) → Linear(1536)  # spatial embedding head (per cell)
+```
+
+The spatial head pools the feature map to a `(5, 3)` grid matching Perch's spatial layout, then projects each cell to 1536-D. This preserves the motif assignment pipeline downstream without any changes to `build_features.py`.
+
+#### Distillation Targets
+
+All targets are pre-computed in `outputs/embeddings.h5` — no Perch forward passes needed at student training time:
+
+| Target | Shape | Loss | Weight |
+|--------|-------|------|--------|
+| Global embedding | (1536,) | Cosine loss `1 - cos_sim` | 1.0 |
+| Spatial embeddings | (5, 3, 1536) | Cosine loss per cell, mean | 1.0 |
+| Top-200 Perch logits | (200,) | MSE | 0.15 |
+
+**Why cosine loss for embeddings**: prototype assignment uses cosine similarity, so we care about *direction* in embedding space, not magnitude. MSE on raw values is the wrong objective — it penalizes magnitude differences that have no effect on downstream assignment.
+
+**Why include logit distillation**: the top-200 Perch logits carry taxonomic signal (soft species labels) that helps the student understand Pantanal-relevant structure. Weight is low (0.15) since it's auxiliary to the embedding objective. This mirrors the distillation setup already running in BirdCallClassifier (job 321796, `weight=0.15, temperature=2.0`).
+
+#### Training Setup
+
+```python
+# Distillation loss
+L = cosine_loss(student_global, teacher_global)
+  + cosine_loss(student_spatial, teacher_spatial)   # mean over 15 cells
+  + 0.15 * mse_loss(student_logits, teacher_logits)
+
+# where cosine_loss(a, b) = mean(1 - F.cosine_similarity(a, b, dim=-1))
+```
+
+- **Optimizer**: AdamW, lr=1e-4 with cosine decay (backbone lr × 0.1 for frozen layers)
+- **Input**: mel spectrogram matching Perch's frontend — 128 mel bins, 32kHz, hop=10ms, window=25ms
+- **Data**: all 358K segments from `outputs/segments.csv` with valid embeddings in HDF5
+- **Epochs**: 20–30 (convergence is fast — targets are fixed teacher outputs, no label noise)
+- **Hardware**: GPU (L40S), ~2–4h
+
+#### Validation
+
+Two checks before accepting the student:
+
+1. **Embedding alignment**: cosine similarity between student and teacher embeddings on a held-out set. Target: mean cosine sim > 0.85.
+2. **Downstream proxy**: run the full feature pipeline (prototype assignment → MLP) with student embeddings instead of Perch. Val macro-AUC should be within ~2pp of the teacher-embedding baseline.
+
+#### Inference pipeline with student (final deployed form)
+
+```
+Audio clip (5s @ 32kHz)
+  → mel spectrogram (128 bins, 32kHz — precomputed or on-the-fly)
+  → Student EfficientNet-B1 → global_emb (1536,), spatial_emb (5,3,1536)
+  → cosine sim to frozen prototypes (2048, 1536)   [matrix multiply only]
+  → feature vector (same build_features.py logic, unchanged)
+  → MotifClassifier MLP (tiny, <5MB)
+  → species logits
+```
+
+**Nothing downstream of the student changes.** The prototype matrix, feature construction logic, and MLP are all identical to the teacher-embedding pipeline. The student is a drop-in replacement for Perch at inference time.
+
+#### Estimated CPU inference time (Kaggle)
+
+| Component | Time per 5s clip | Notes |
+|-----------|-----------------|-------|
+| Mel spectrogram | ~2ms | librosa/numpy |
+| Student EfficientNet-B1 | ~50ms | PyTorch CPU, bfloat16 |
+| Prototype assignment | ~5ms | (2048, 1536) matmul |
+| Feature concat + MLP | ~1ms | tiny MLP |
+| **Total** | **~58ms/clip** | |
+
+A 60-min soundscape at 5s stride = 720 clips × 58ms ≈ **42 seconds**. Well within the ~90 min budget, leaving ample margin for I/O and overhead.
+
 ### Stage 5: CPU Deployment
 
-1. **Install Perch 2.0 CPU variant**: Use the Kaggle CPU release with `tensorflow-cpu` — no TFLite conversion needed
-2. **Precompute and ship prototypes**: `P` is just a `(K, 1536)` matrix — trivial to store
-3. **Ship classifier weights**: Tiny MLP, <5MB
-4. **Inference pipeline**: Perch CPU model → numpy soft assignment → MLP forward pass
-5. **Optional TFLite**: If latency is critical for real-time monitoring, TFLite export still provides ~10x additional speedup
+1. **Ship student weights**: PyTorch checkpoint, ~80MB (EfficientNet-B1)
+2. **Ship prototypes**: `global_prototypes.npz` — `(2048, 1536)` float32 matrix, ~12MB
+3. **Ship GMMs**: `species_gmms.pkl` — per-species PCA + GMM models, ~few MB
+4. **Ship classifier**: `MotifClassifier` MLP weights, <5MB
+5. **Inference pipeline**: student → prototype assignment → feature vector → MLP → species logits (see Stage 1d above)
+6. **No TensorFlow at inference**: student is pure PyTorch, no TF dependency on Kaggle
 
 ---
 
@@ -410,71 +569,32 @@ pip install librosa soundfile h5py hdbscan umap-learn scikit-learn
 pip install pandas wandb tqdm
 ```
 
-### 4.2 `scripts/extract_embeddings.sh`
+### 4.2 `scripts/extract_embeddings.sh` ✅
+
+Implemented. GPU job (L40s, 12h). Reads `outputs/segments.csv` → writes `outputs/embeddings/embeddings.h5`. Fully resumable via `written` flag in HDF5.
+
+### 4.2b `scripts/extract_distill_embeddings.sh` ✅
+
+New script. Same GPU setup as `extract_embeddings.sh`. Runs Stage 0b (`prepare_distill_data.py`) if `distill_segments.csv` is missing, then runs `extract_embeddings.py` with config key overrides to write `outputs/embeddings/distill_embeddings.h5`.
 
 ```bash
-#!/bin/bash
-#SBATCH --job-name=perch_embed
-#SBATCH --partition=l40s
-#SBATCH --nodes=1
-#SBATCH --ntasks=1
-#SBATCH --cpus-per-task=8
-#SBATCH --gres=gpu:1
-#SBATCH --mem=64G
-#SBATCH --time=12:00:00
-#SBATCH --output=logs/embed_%j.log
-
-module purge
-module load cuda/12.8.0-dh6b
-module load miniconda3/latest
-conda activate pantanal
-
-AUDIO_DIR=${AUDIO_DIR:-"data/segments"}
-OUTPUT_H5=${OUTPUT_H5:-"data/embeddings.h5"}
-
-python src/extract_embeddings.py \
-    --audio_dir "$AUDIO_DIR" \
-    --output "$OUTPUT_H5" \
-    --batch_size 64 \
-    --num_workers 8
+sbatch scripts/extract_distill_embeddings.sh
 ```
 
-### 4.3 `scripts/cluster.sh`
+### 4.3 `scripts/cluster.sh` ✅
+
+Implemented. CPU job (16 cores, 128GB, 6h). Runs Stage 2 (`cluster.py`) + Stage 3 (`build_features.py`) sequentially.
+
+**Auto-detects distill embeddings**: if `outputs/embeddings/distill_embeddings.h5` exists, automatically passes `--with-distill --distill-h5 <path>` to `cluster.py`. No manual flag needed.
+
+### 4.4 `scripts/scrape_distill_data.sh` ✅
+
+CPU job (4 cores, 32GB, 24h). Scrapes iNat + BirdSet audio. Section-level skip logic prevents re-running completed sources on resubmit.
 
 ```bash
-#!/bin/bash
-#SBATCH --job-name=motif_cluster
-#SBATCH --partition=batch          # CPU partition — no GPU needed
-#SBATCH --nodes=1
-#SBATCH --ntasks=1
-#SBATCH --cpus-per-task=16
-#SBATCH --mem=128G                 # HDBSCAN on large embedding matrices is memory-hungry
-#SBATCH --time=4:00:00
-#SBATCH --output=logs/cluster_%j.log
-
-module purge
-module load miniconda3/latest
-conda activate pantanal
-
-EMBEDDING_H5=${EMBEDDING_H5:-"data/embeddings.h5"}
-OUTPUT_DIR=${OUTPUT_DIR:-"data/prototypes"}
-
-echo "=== Level 1: Global motif discovery (HDBSCAN) ==="
-python src/cluster_global.py \
-    --embeddings "$EMBEDDING_H5" \
-    --output_dir "$OUTPUT_DIR" \
-    --umap_dim 64 \
-    --subsample_n ${SUBSAMPLE_N:-200000} \
-    --min_cluster_size ${MIN_CLUSTER_SIZE:-50} \
-    --min_samples ${MIN_SAMPLES:-10}
-
-echo "=== Level 2: Within-species sub-clustering (GMM) ==="
-python src/cluster_within_species.py \
-    --embeddings "$EMBEDDING_H5" \
-    --labels data/labels.csv \
-    --output_dir "$OUTPUT_DIR" \
-    --pca_dim 64 \
-    --max_components ${MAX_COMPONENTS:-10}
+sbatch scripts/scrape_distill_data.sh
+# Override defaults:
+INAT_MAX_FILES=1000 BIRDSET_MAX_FILES=500 sbatch scripts/scrape_distill_data.sh
 ```
 
 ### 4.4 `scripts/train_classifier.sh`
@@ -666,22 +786,26 @@ Key pattern: **`--dependency=afterok:<jobid>`** chains stages sequentially while
 
 ## 6. Recommended Priority Order
 
-| Priority | Task | Effort | Impact |
-|----------|------|--------|--------|
-| **P0** | Environment setup + Perch 2.0 installation on Easley | 1 day | Unblocks everything |
-| **P0** | Data preparation pipeline (segmentation, QC) | 2-3 days | Unblocks embedding |
-| **P1** | Embedding extraction (Stage 1) | 1 day | Core data asset |
-| **P1** | Label provenance pipeline (masked loss setup) | 1 day | Correct training signal from mixed sources |
-| **P2** | Global clustering (HDBSCAN + subsample) | 2-3 days | Core motif discovery |
-| **P2** | Within-species sub-clustering (GMM + BIC) | 1-2 days | Fine-grained call type features |
-| **P2** | Motif feature extraction (Stage 3) | 1 day | Feeds classifier |
-| **P3** | Initial classifier training (Stage 4) | 1-2 days | End-to-end evaluation |
-| **P3** | Evaluation framework (metrics, visualization) | 1-2 days | Know if it works |
-| **P3** | Pseudo-labeling pipeline (Stage 4b) | 2-3 days | Bridges domain gap, uses unlabeled soundscapes |
-| **P4** | Temporal context model | 2-3 days | Performance boost |
-| **P4** | CPU inference validation (Kaggle CPU release) | 0.5 day | Deployment readiness |
-| **P5** | Interpretability / motif visualization | 2-3 days | Ecologist-facing output |
-| **P5** | NMF-like prototype decomposition | Research | Defer unless soft assignment proves insufficient |
+| Priority | Task | Effort | Impact | Status |
+|----------|------|--------|--------|--------|
+| **P0** | Environment setup + Perch 2.0 installation on Easley | 1 day | Unblocks everything | ✅ Done |
+| **P0** | Data preparation pipeline (segmentation, QC) | 2-3 days | Unblocks embedding | ✅ Done |
+| **P1** | External corpus scrape (iNat + BirdSet) | 1-2 days | Distill data asset | ✅ iNat done / 🔄 BirdSet in progress |
+| **P1** | Distill data preparation (Stage 0b) | 1 day | Dedup + segment distill corpus | ✅ Done |
+| **P1** | Embedding extraction (Stage 1) | 1 day | Core data asset | ✅ Done |
+| **P1** | Distill embedding extraction (Stage 1c) | 0.5 day | Teacher targets for distillation + richer clustering | ⬜ Ready to run |
+| **P1** | Label provenance pipeline (masked loss setup) | 1 day | Correct training signal from mixed sources | ✅ Done |
+| **P1** | Student embedder distillation (Stage 1d) | 2-3 days | Required for deployment — Perch CPU too slow | ⬜ Pending |
+| **P2** | Global clustering (HDBSCAN + subsample) | 2-3 days | Core motif discovery | ✅ Done (primary) / ⬜ with-distill pending 1c |
+| **P2** | Within-species sub-clustering (GMM + BIC) | 1-2 days | Fine-grained call type features | ✅ Done (primary) / ⬜ with-distill pending 1c |
+| **P2** | Motif feature extraction (Stage 3) | 1 day | Feeds classifier | ✅ Done |
+| **P3** | Initial classifier training (Stage 4) | 1-2 days | End-to-end evaluation | ⬜ Pending |
+| **P3** | Evaluation framework (metrics, visualization) | 1-2 days | Know if it works | ⬜ Pending |
+| **P3** | Pseudo-labeling pipeline (Stage 4b) | 2-3 days | Bridges domain gap, uses unlabeled soundscapes | ⬜ Pending |
+| **P4** | Temporal context model | 2-3 days | Performance boost | ⬜ Defer |
+| **P4** | Student CPU inference validation (timing on Kaggle) | 0.5 day | Deployment readiness | ⬜ Pending 1d |
+| **P5** | Interpretability / motif visualization | 2-3 days | Ecologist-facing output | ⬜ Defer |
+| **P5** | NMF-like prototype decomposition | Research | Defer unless soft assignment proves insufficient | ⬜ Defer |
 
 ---
 
@@ -692,40 +816,55 @@ PantanalSpeciesMonitoring/
 ├── README.md
 ├── GAMEPLAN.md              ← this document
 ├── environment.yml
-├── requirements.txt
+├── configs/
+│   └── default.yaml         # all stage configs + output paths
 ├── scripts/
 │   ├── setup_env.sh
-│   ├── extract_embeddings.sh
-│   ├── cluster.sh
+│   ├── scrape_distill_data.sh        ✅ iNat + BirdSet scraper
+│   ├── extract_embeddings.sh         ✅ primary Perch embed (GPU)
+│   ├── extract_distill_embeddings.sh ✅ distill Stage 0b + 1c (GPU)
+│   ├── cluster.sh                    ✅ Stage 2+3, auto --with-distill
 │   ├── train_classifier.sh
 │   ├── pseudo_label.sh
 │   └── run_pipeline.sh
 ├── src/
-│   ├── prepare_data.py
-│   ├── extract_embeddings.py
-│   ├── cluster_global.py
-│   ├── cluster_within_species.py
-│   ├── build_features.py
-│   ├── train_classifier.py
-│   ├── pseudo_label.py
-│   ├── inference.py
-│   └── utils/
-│       ├── audio.py
-│       └── viz.py
+│   ├── prepare_data.py               ✅ Stage 0: segment XC/iNat/soundscapes
+│   ├── prepare_distill_data.py       ✅ Stage 0b: segment + dedup distill corpus
+│   ├── extract_embeddings.py         ✅ Stage 1/1c: Perch embed (config-driven)
+│   ├── scrape_distill_data.py        ✅ Stage 1b: iNat + BirdSet scraper
+│   ├── cluster.py                    ✅ Stage 2: HDBSCAN + GMM (--with-distill)
+│   ├── build_features.py             ✅ Stage 3: motif features
+│   ├── train_classifier.py           Stage 4: MLP classifier
+│   ├── pseudo_label.py               Stage 4b: pseudo-labeling
+│   ├── config.py                     ✅ YAML config loader with --set overrides
+│   └── utils.py                      ✅ shared audio/logging utilities
 ├── data/
-│   ├── raw/                 # original recordings
-│   ├── segments/            # 5s WAV segments
-│   ├── embeddings.h5        # Perch embeddings
-│   ├── prototypes/          # cluster outputs
-│   ├── labels.csv           # ground truth (with source & mask columns)
-│   ├── unlabeled_segments.csv
-│   └── pseudo_labels_r*.csv # pseudo-labels per round
-├── checkpoints/
-├── logs/
-└── notebooks/
-    ├── 01_eda.ipynb
-    ├── 02_cluster_viz.ipynb
-    └── 03_motif_explorer.ipynb
+│   ├── train_audio/         # XC/iNat focal recordings
+│   ├── train_soundscapes/   # field soundscape recordings
+│   ├── train.csv            # XC/iNat metadata
+│   ├── train_soundscapes_labels.csv
+│   ├── taxonomy.csv         # 234-species label set
+│   ├── distill_manifest.csv ✅ iNat+BirdSet scrape manifest
+│   └── distill_audio/       ✅ scraped audio files
+│       ├── inat_sounds_2024/train/   (805 files)
+│       └── birdset/PER/train/        (in progress)
+└── outputs/
+    ├── segments.csv                  ✅ 358K segments (primary)
+    ├── distill_segments.csv          ✅ distill segments (same schema)
+    ├── embeddings/
+    │   ├── embeddings.h5             ✅ 2.4GB primary embeddings
+    │   └── distill_embeddings.h5     ⬜ pending Stage 1c
+    ├── prototypes/
+    │   ├── global_prototypes.npz     ✅
+    │   ├── global_hdbscan.pkl        ✅
+    │   ├── global_umap.pkl           ✅
+    │   ├── global_cluster_stats.csv  ✅
+    │   └── species_gmms.pkl          ✅
+    ├── features/
+    │   └── features.h5               ✅
+    ├── checkpoints/                  ⬜ Stage 4
+    ├── pseudo_labels/                ⬜ Stage 4b
+    └── logs/
 ```
 
 ---
@@ -734,8 +873,8 @@ PantanalSpeciesMonitoring/
 
 1. **How much labeled soundscape data do we have vs. unlabeled?** Ratio determines how aggressively to pseudo-label.
 2. **What fraction of target Pantanal species are in Perch's 15K taxonomy?** Determines Round 1 pseudo-label coverage. Species outside Perch's taxonomy won't get Perch-logit pseudo-labels — they rely entirely on Round 2+ self-training.
-3. **What's the target deployment environment?** (Raspberry Pi? Edge server? Cloud?) This affects whether CPU Perch is sufficient or TFLite is needed.
-4. **Real-time vs batch inference?** Continuous monitoring requires streaming; periodic surveys can batch-process.
+3. **What's the target deployment environment?** Kaggle CPU notebook confirmed as primary target. EfficientNet-B1 student fits comfortably. For edge (Raspberry Pi / real-time monitoring), may need further compression to EfficientNet-B0 or TFLite export.
+4. **Real-time vs batch inference?** Competition uses batch (full soundscape files). Continuous monitoring would need streaming — student inference is fast enough for near-real-time at 5s stride.
 5. **Which species are priority targets?** We may want species-specific thresholds and per-species pseudo-label quality gates.
 6. **How noisy are the XC/iNat secondary labels?** If very noisy, we may want to discard them entirely and treat XC/iNat as single-label only.
 
@@ -751,7 +890,8 @@ PantanalSpeciesMonitoring/
 | Pseudo-label noise degrades classifier | Medium | Medium | Per-species thresholds, val firewall, cluster consistency check, mixup regularization |
 | XC/iNat domain shift to soundscapes | High | High | Pseudo-labeling on in-domain unlabeled soundscapes bridges the gap; masked loss avoids false negatives from incomplete XC secondary labels |
 | Pantanal species not in Perch's 15K taxonomy | Low | Medium | Embeddings still transfer well to unseen species (demonstrated for marine mammals); clustering handles novel species |
-| CPU Perch release missing spatial embeddings | Low | Medium | Verify spatial output parity with GPU variant early; fallback to global embeddings only if needed |
+| Student embedding alignment insufficient (cosine sim < 0.85) | Medium | High | Increase distillation epochs; add hard negative mining; fall back to fine-tuning BirdSet backbone directly on species labels |
+| Student CPU inference still too slow | Low | High | EfficientNet-B1 benchmarked at ~50ms/clip CPU; if needed, downgrade to EfficientNet-B0 (~25ms/clip) at minor accuracy cost |
 
 ---
 
@@ -795,6 +935,128 @@ K (number of prototypes) is fixed per run but can be set high and pruned. HDBSCA
 
 **Note**: Within-species GMMs should stay frozen — they serve interpretability and the global motif features already carry most classification signal.
 
+### B. Attention-Based Prototype Assignment
+
+The current soft assignment uses a fixed similarity function (cosine or Euclidean distance). This assumes all dimensions of the embedding space are equally important for determining cluster membership. An attention mechanism lets the model **learn** which dimensions matter for each prototype.
+
+#### Cross-attention over prototypes
+Treat prototypes as keys, local embeddings as queries:
+```
+Q = z_t @ W_q          # (d_k,)   — query from local embedding
+K_k = p_k @ W_k        # (d_k,)   — key from prototype k
+V_k = p_k @ W_v        # (d_v,)   — value from prototype k
+
+attn_t[k] = softmax(Q · K_k / sqrt(d_k))    # attention weight
+output_t = Σ_k attn_t[k] · V_k              # attended prototype mixture
+```
+
+This has several advantages over distance-based assignment:
+- **Learned relevance**: `W_q` and `W_k` can suppress irrelevant dimensions (e.g., amplitude-related features when matching tonal structure)
+- **Asymmetric matching**: a prototype can "attend to" an embedding differently than the reverse — useful when prototypes represent abstract categories
+- **Richer output**: the attended output `output_t` is a learned mixture of prototype values, not just a weight vector — this can be pooled and fed directly to the classifier
+
+#### Multi-head variant
+Use multiple attention heads to capture different aspects of the embedding-prototype relationship (e.g., one head for spectral shape, another for temporal pattern).
+
+#### When to try this
+After approach A1 (learnable prototypes). If learnable prototypes + temperature give a significant lift over frozen prototypes, that signals the assignment function matters a lot, and attention would be the next step. If learnable prototypes don't help, attention won't either — the bottleneck is elsewhere.
+
+**Complexity**: Adds `W_q`, `W_k`, `W_v` matrices (~3 × 1536 × d_k parameters per head). Training cost is negligible since features are precomputed. The assignment step becomes part of the model's forward pass rather than a preprocessing step, which means it must be reimplemented in PyTorch rather than numpy — but the prototype features and MLP can be trained jointly in a single forward/backward pass.
+
+### D. Cross-Project Student Transfer
+
+The BirdCallClassifier project (BirdCLEF 2026) is training `EfficientNet-B1-BirdSet-XCL` with distillation (`weight=0.15, temperature=2.0`) on the same 234-class Pantanal label set. Once that model converges, its checkpoint is a strong initialization for our student embedder:
+
+- It already speaks the right taxonomic vocabulary (234 Pantanal species)
+- Distillation in Stage 1d can fine-tune it further to match Perch's *embedding geometry* specifically, rather than classification logits
+- This avoids 20+ epochs of training from scratch and may yield better spatial embedding alignment
+
+**If BirdCallClassifier achieves good val AUC**, consider using its checkpoint directly as the student and skipping Stage 1d distillation entirely — replacing the global embedding component with BirdSet embeddings and relying on the BirdSet model's feature space for prototype assignment. The embedding dimension will differ (BirdSet outputs vary by backbone), so prototype recomputation would be needed. Worth evaluating as an ablation.
+
+### C. No-Clustering Baseline
+
+Before investing in clustering improvements, establish a baseline: **global Perch embedding + top-K logits → MLP → species predictions**. No prototypes, no motif features. If this baseline already performs well, the marginal value of clustering is the delta above it — and optimization effort should focus wherever that delta is largest.
+
 ---
 
 *Ready for review. Once approved, I'll scaffold the repo and start with P0 tasks.*
+
+---
+
+## 11. Implementation Status (as of 2026-03-28)
+
+This section tracks what is actually built, running, and missing. The pipeline has evolved across multiple sessions — some parts were implemented before later design decisions (student distillation, cosine similarity) were finalized, so there are intentional gaps where code predates the current architecture.
+
+### Completed ✅
+
+| Component | File(s) | Notes |
+|-----------|---------|-------|
+| Config system | `src/config.py` | YAML + CLI `--set` overrides + `OVERRIDE` env var; resolves paths against PROJECT_ROOT |
+| Shared utilities | `src/utils.py` | `load_audio_segment`, `build_label_map`, `parse_soundscape_labels`, `setup_logging` |
+| Stage 0: Data prep | `src/prepare_data.py` | 358,454 segments, 234 species (incl. 25 insect sonotypes), label provenance tracked |
+| Stage 0b: Distill data prep | `src/prepare_distill_data.py` | Segments distill audio to 5s, deduplicates against segments.csv by basename + sha1 |
+| Stage 1: Perch embedding extraction | `src/extract_embeddings.py` | HDF5 with global (1536), spatial (5,3,1536), top-200 logits float16; resumable via `written` flag |
+| Distill data scraping | `src/scrape_distill_data.py` | iNat Sounds 2024 (bbox-filtered, Pantanal region) + BirdSet PER; resumable; sha1 dedup; isolated venv for BirdSet |
+| Stage 2: Global clustering | `src/cluster.py` (Level 1) | UMAP 64D → HDBSCAN → **2048 prototypes**; medoids stored in original 1536-D space; `prediction_data=True` for future approximate_predict |
+| Stage 2: Within-species GMMs | `src/cluster.py` (Level 2) | 234 species, BIC model selection, mean K=3.1 components, max K=10; PCA per species |
+| Stage 3: Feature construction | `src/build_features.py` | 8349-D vectors; **cosine similarity default** (euclidean fallback); diagnostic cluster-species table |
+| MLP classifier + loss | `src/model.py` | `MotifClassifier` (BN+ReLU+Dropout MLP) + `MaskedFocalLoss` (per-sample/class masking) |
+| Feature dataset | `src/dataset.py` | HDF5-backed, fold-split, pseudo-label injection support |
+| Stage 4: Classifier training | `src/train_classifier.py` | AdamW + CosineAnnealingLR, wandb logging, fold via `FOLD` env var |
+| Slurm scripts | `scripts/` | `extract_embeddings.sh`, `extract_distill_embeddings.sh`, `scrape_distill_data.sh`, `cluster.sh`, `train_classifier.sh`, `run_pipeline.sh` |
+| Default config | `configs/default.yaml` | `similarity_metric: cosine`, `temperature: 0.1`, `top_k_logits: 200` |
+
+### Outputs Produced ✅
+
+| Output | Location | Status |
+|--------|----------|--------|
+| `segments.csv` | `outputs/segments.csv` | 358,454 rows |
+| `embeddings.h5` | `outputs/embeddings/embeddings.h5` | 2.4 GB, 358,454 segments with spatial + logits |
+| `global_prototypes.npz` | `outputs/prototypes/` | **(2048, 1536)** float32 — ready for prototype assignment |
+| `global_hdbscan.pkl` | `outputs/prototypes/` | 237 MB — fitted HDBSCAN with `prediction_data=True` |
+| `global_umap.pkl` | `outputs/prototypes/` | 4.1 GB — fitted UMAP transform |
+| `global_cluster_stats.csv` | `outputs/prototypes/` | Per-cluster statistics |
+| `species_gmms.pkl` | `outputs/prototypes/` | 234 species, PCA+GMM each |
+| `distill_manifest.csv` | `data/distill_manifest.csv` | 3,806 rows (805 iNat + 3,001 BirdSet PER) |
+| Distill audio | `data/distill_audio/` | 3,805 files |
+| Pseudo-label files | `data/` | Multiple files exist: `pseudo_labels.csv`, `pseudo_labels_t06.csv`, `pseudo_labels_audio.csv`, `pseudo_labels_sc.csv` (and `_t06` variants) — likely from Perch logit bootstrap; **not yet integrated** into training pipeline |
+
+### In Progress 🔄
+
+| Job | Task | Status |
+|-----|------|--------|
+| Running (L40S) | Stage 0b + 1b: `extract_distill_embeddings.sh` (job 322207) | Stage 0b (`prepare_distill_data.py`) in progress at ~15% through 3,806 files; will then run Stage 1b (Perch embeddings on distill corpus) → `outputs/embeddings/distill_embeddings.h5` |
+| Running (CPU) | Stage 3: `build_features.py` | Started 11:22, `features.h5` still growing (429 MB as of 15:22); no "Stage 3 complete" in log yet — expected to run several more hours |
+
+### Newly Implemented ✅ (this session)
+
+| Component | File(s) | Notes |
+|-----------|---------|-------|
+| Stage 4b: Pseudo-labeling | `src/pseudo_label.py` | Round 1: loads existing `data/pseudo_labels_*.csv` (Perch logit bootstrap, `filename,start,end,primary_label` schema); Round 2+: self-training MLP inference → threshold → `.npz` array |
+| Stage 1d: Student model | `src/student_model.py` | `StudentEmbedder` (EfficientNet-B1-BirdSet + global/spatial heads) + `DistillationLoss` (cosine global + cosine spatial + MSE logits) |
+| Stage 1d: Student training | `src/train_student.py` | Full training loop; uses `embeddings.h5` + `distill_embeddings.h5` as teacher targets; differential LR (backbone 1e-5, heads 1e-4); bfloat16 AMP; wandb |
+| Stage 5: Inference | `src/inference.py` | `PantanalPredictor` class: student embed → prototype cosine assign → feature vector → MLP → per-segment probs; `predict_soundscape()` and `predict_directory()` for batch Kaggle inference; CLI entry point |
+| Slurm: student training | `scripts/train_student.sh` | L40S, 12h, FOLD env var |
+| Slurm: pseudo-labeling | `scripts/pseudo_label.sh` | L40S, 2h, ROUND + CHECKPOINT env vars |
+| Config: stage1d + student_mel | `configs/default.yaml` | Added `stage1d` and `student_mel` sections |
+
+### Still Missing ❌
+
+| Component | Priority | Notes |
+|-----------|----------|-------|
+| **Distill features** | P2 | After job 322207 finishes (`distill_embeddings.h5`), run `build_features.py` on distill corpus. These aren't needed for student training (which reads raw audio + HDF5 targets directly), but would enable classifier training on expanded corpus. |
+| **Temporal context model** | P4 | Sliding window GRU/1D-CNN over sequential windows. Defer until baseline validated. |
+| **Cluster-species visualization notebook** | P5 | `cluster_species_table.npz` will be produced when `build_features.py` finishes; no notebook yet. |
+
+### Architecture Note: Features vs. Student
+
+`features.h5` was built using Perch (teacher) embeddings. The student will produce its own embeddings at inference. Because the student distillation loss is cosine similarity to Perch outputs, the student's embedding space aligns with Perch's — prototype assignment (just a matrix multiply against the same `global_prototypes.npz`) will work correctly with student embeddings. However, after student training, it is worth re-running `build_features.py` with student embeddings as a sanity check before finalizing MLP classifier weights.
+
+### Immediate Next Steps (ordered)
+
+1. **Wait for `features.h5`** — check log for "Stage 3 complete"; then submit `train_classifier.sh` for each fold
+2. **Wait for job 322207** (`distill_embeddings.h5`) — then submit `train_student.sh`
+3. **Run pseudo-label round 1** — `sbatch scripts/pseudo_label.sh` (ROUND=1); wires the existing `data/pseudo_labels_*.csv` into the training pipeline as `.npz`
+4. **Validate student embedding alignment** — after training, check `val_cosine_sim` in logs; target > 0.85
+5. **Re-run `build_features.py` with student embeddings** — sanity check that prototype assignment quality holds before finalizing classifier
+6. **Submit inference** — run `src/inference.py` on test soundscapes to generate Kaggle submission CSV

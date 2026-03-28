@@ -9,8 +9,12 @@ using BIC-selected Gaussian Mixture Models.
 Usage:
     python src/cluster.py
     python src/cluster.py --set stage2.global.subsample_n=100000
+
+    # Include distill embeddings in both clustering levels:
+    python src/cluster.py --with-distill
 """
 
+import argparse
 import pickle
 import numpy as np
 import pandas as pd
@@ -23,10 +27,65 @@ from utils import setup_logging, build_label_map, parse_soundscape_labels
 
 
 # ─────────────────────────────────────────────
+# Helpers for optional distill merge
+# ─────────────────────────────────────────────
+
+def _open_h5_pair(primary_h5: str, distill_h5: str | None, logger):
+    """Open primary HDF5 and optionally a distill HDF5.
+
+    Returns (h5_primary, h5_distill_or_None, n_primary, n_distill).
+    The caller is responsible for closing both files.
+    """
+    h5p = h5py.File(primary_h5, "r")
+    written_p = h5p["written"][:]
+    n_primary = int(written_p.sum())
+
+    h5d = None
+    n_distill = 0
+    if distill_h5 and Path(distill_h5).exists():
+        h5d = h5py.File(distill_h5, "r")
+        written_d = h5d["written"][:]
+        n_distill = int(written_d.sum())
+        logger.info(f"Merging distill embeddings: {n_distill} valid segments "
+                    f"from {distill_h5}")
+    elif distill_h5:
+        logger.warning(f"--with-distill specified but {distill_h5} not found; "
+                       f"proceeding with primary embeddings only")
+
+    logger.info(f"Primary valid embeddings: {n_primary}"
+                + (f", distill: {n_distill}" if n_distill else ""))
+    return h5p, h5d, written_p, n_primary, n_distill
+
+
+def _load_spatial_sample(h5f, written, subsample_n, rng, logger):
+    """Return a (M, 1536) array sampled from spatial or global embeddings."""
+    valid_indices = np.where(written)[0]
+    has_spatial = "spatial_embeddings" in h5f
+    n_per_segment = 15 if has_spatial else 1
+
+    n_needed = subsample_n // n_per_segment + 1
+    if n_needed >= len(valid_indices):
+        sampled = valid_indices
+    else:
+        sampled = rng.choice(valid_indices, n_needed, replace=False)
+
+    chunks = []
+    if has_spatial:
+        for i in range(0, len(sampled), 500):
+            batch = sorted(sampled[i:i + 500])
+            for idx in batch:
+                chunks.append(h5f["spatial_embeddings"][idx].reshape(-1, 1536))
+    else:
+        chunks.append(h5f["global_embeddings"][sorted(sampled)])
+
+    return np.vstack(chunks)
+
+
+# ─────────────────────────────────────────────
 # Level 1: Global Motif Discovery
 # ─────────────────────────────────────────────
 
-def cluster_global(cfg: dict, logger):
+def cluster_global(cfg: dict, logger, distill_h5: str | None = None):
     """Discover global motif prototypes via HDBSCAN on spatial embeddings."""
     import umap
     import hdbscan
@@ -36,58 +95,40 @@ def cluster_global(cfg: dict, logger):
     out_dir = Path(cfg["outputs"]["prototypes_dir"])
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Load spatial embeddings (memory-mapped)
-    logger.info("Loading spatial embeddings from HDF5")
-    h5f = h5py.File(h5_path, "r")
-    written = h5f["written"][:]
-    n_valid = int(written.sum())
-    logger.info(f"Valid embeddings: {n_valid}")
-
-    has_spatial = "spatial_embeddings" in h5f
-    if has_spatial:
-        spatial = h5f["spatial_embeddings"]  # (N, 5, 3, 1536) — keep lazy
-        n_per_segment = 15  # 5 * 3
-        emb_dim = 1536
-    else:
-        logger.warning("No spatial embeddings found, using global embeddings")
-        spatial = None
-        n_per_segment = 1
-        emb_dim = 1536
-
-    # Subsample for HDBSCAN
-    subsample_n = min(gcfg["subsample_n"], n_valid * n_per_segment)
-    logger.info(f"Subsampling {subsample_n} local embeddings for HDBSCAN")
-
-    valid_indices = np.where(written)[0]
     rng = np.random.RandomState(42)
+    subsample_n = gcfg["subsample_n"]
 
-    if has_spatial:
-        # Sample segment indices, then flatten spatial positions
-        n_segments_needed = subsample_n // n_per_segment + 1
-        if n_segments_needed >= len(valid_indices):
-            sampled_seg_idx = valid_indices
+    h5p, h5d, written_p, n_primary, n_distill = _open_h5_pair(
+        h5_path, distill_h5, logger
+    )
+    try:
+        # Allocate subsample budget proportionally if merging
+        if h5d is not None and n_distill > 0:
+            total_valid = n_primary + n_distill
+            budget_p = int(subsample_n * n_primary / total_valid)
+            budget_d = subsample_n - budget_p
         else:
-            sampled_seg_idx = rng.choice(valid_indices, n_segments_needed,
-                                         replace=False)
+            budget_p = subsample_n
+            budget_d = 0
 
-        # Load sampled spatial embeddings into memory
-        logger.info(f"Loading {len(sampled_seg_idx)} segments' spatial embeddings")
-        chunks = []
-        for i in tqdm(range(0, len(sampled_seg_idx), 500), desc="Loading spatial"):
-            batch_idx = sorted(sampled_seg_idx[i:i+500])
-            for idx in batch_idx:
-                chunk = spatial[idx]  # (5, 3, 1536)
-                chunks.append(chunk.reshape(-1, emb_dim))  # (15, 1536)
+        logger.info(f"Loading primary spatial sample (budget={budget_p})")
+        local_p = _load_spatial_sample(h5p, written_p, budget_p, rng, logger)
 
-        all_local = np.vstack(chunks)  # (M, 1536)
+        if h5d is not None and budget_d > 0:
+            written_d = h5d["written"][:]
+            logger.info(f"Loading distill spatial sample (budget={budget_d})")
+            local_d = _load_spatial_sample(h5d, written_d, budget_d, rng, logger)
+            all_local = np.vstack([local_p, local_d])
+        else:
+            all_local = local_p
+
         if len(all_local) > subsample_n:
             all_local = all_local[rng.choice(len(all_local), subsample_n,
                                              replace=False)]
-    else:
-        # Use global embeddings directly
-        sampled_seg_idx = rng.choice(valid_indices, min(subsample_n, len(valid_indices)),
-                                     replace=False)
-        all_local = h5f["global_embeddings"][sorted(sampled_seg_idx)]
+    finally:
+        h5p.close()
+        if h5d is not None:
+            h5d.close()
 
     logger.info(f"Subsample shape: {all_local.shape}")
 
@@ -153,7 +194,6 @@ def cluster_global(cfg: dict, logger):
     })
     stats.to_csv(out_dir / "global_cluster_stats.csv", index=False)
 
-    h5f.close()
     logger.info(f"Global clustering complete. {n_clusters} prototypes saved "
                 f"to {out_dir}")
     return prototypes, clusterer, reducer
@@ -163,8 +203,12 @@ def cluster_global(cfg: dict, logger):
 # Level 2: Within-Species Sub-Clustering
 # ─────────────────────────────────────────────
 
-def cluster_within_species(cfg: dict, logger):
-    """Fit per-species GMMs with BIC-based model selection."""
+def cluster_within_species(cfg: dict, logger, distill_h5: str | None = None):
+    """Fit per-species GMMs with BIC-based model selection.
+
+    If distill_h5 is provided, labeled distill segments are merged with
+    primary segments to enrich the per-species embedding pools.
+    """
     from sklearn.mixture import GaussianMixture
     from sklearn.decomposition import PCA
 
@@ -174,26 +218,57 @@ def cluster_within_species(cfg: dict, logger):
     out_dir = Path(cfg["outputs"]["prototypes_dir"])
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Load segments metadata
+    # Load primary segments metadata
     segments = pd.read_csv(segments_csv, low_memory=False)
     labeled = segments[segments["is_labeled"] == True].copy()
 
     # Build species -> segment indices mapping
     # For XC/iNat: primary_label is a single species
     # For soundscapes: primary_label is semicolon-separated
-    species_to_indices = {}
+    species_to_indices = {}  # {species: [primary_seg_indices]}
     for idx, row in labeled.iterrows():
         labels = str(row["primary_label"]).split(";")
         for sp in labels:
             sp = sp.strip()
             if sp and sp != "nan":
-                if sp not in species_to_indices:
-                    species_to_indices[sp] = []
-                species_to_indices[sp].append(idx)
+                species_to_indices.setdefault(sp, []).append(idx)
 
-    logger.info(f"Found {len(species_to_indices)} species with labeled data")
+    logger.info(f"Found {len(species_to_indices)} species with labeled data "
+                f"(primary)")
 
-    # Load global embeddings
+    # Optionally load distill segments and build a parallel index
+    distill_species_to_indices: dict[str, list[int]] = {}
+    h5d = None
+    written_d: np.ndarray | None = None
+    if distill_h5 and Path(distill_h5).exists():
+        distill_seg_csv = cfg["outputs"].get(
+            "distill_segments_csv", "outputs/distill_segments.csv"
+        )
+        if Path(distill_seg_csv).exists():
+            dseg = pd.read_csv(distill_seg_csv, low_memory=False)
+            dlabeled = dseg[dseg["is_labeled"] == True].copy()
+            for idx, row in dlabeled.iterrows():
+                sp = str(row["primary_label"]).strip()
+                if sp and sp != "nan":
+                    distill_species_to_indices.setdefault(sp, []).append(idx)
+            h5d = h5py.File(distill_h5, "r")
+            written_d = h5d["written"][:]
+            n_added = sum(
+                1 for sp in distill_species_to_indices
+                if sp in species_to_indices
+            )
+            logger.info(
+                f"Distill labeled segments: "
+                f"{len(distill_species_to_indices)} species, "
+                f"{n_added} overlap with primary taxonomy"
+            )
+        else:
+            logger.warning(
+                f"distill_h5 specified but {distill_seg_csv} not found; "
+                f"skipping distill merge for GMM"
+            )
+
+    # Load primary global embeddings
     h5f = h5py.File(h5_path, "r")
     global_emb = h5f["global_embeddings"]
     written = h5f["written"][:]
@@ -202,19 +277,37 @@ def cluster_within_species(cfg: dict, logger):
     max_K = scfg["max_components"]
     min_per_comp = scfg["min_samples_per_component"]
 
+    # Merge species sets (primary + distill)
+    all_species = set(species_to_indices) | set(distill_species_to_indices)
     species_models = {}  # {species_id: {"pca": PCA, "gmm": GMM, "n_components": K}}
 
-    for sp, seg_indices in tqdm(species_to_indices.items(),
-                                desc="Within-species GMM"):
-        # Filter to valid (embedded) indices
-        valid = [i for i in seg_indices if i < len(written) and written[i]]
+    for sp in tqdm(all_species, desc="Within-species GMM"):
+        # Primary valid embeddings
+        p_idx = species_to_indices.get(sp, [])
+        valid_p = [i for i in p_idx if i < len(written) and written[i]]
+        emb_p = global_emb[sorted(valid_p)] if valid_p else np.empty((0, 1536), dtype=np.float32)
+
+        # Distill valid embeddings
+        if h5d is not None and written_d is not None:
+            d_idx = distill_species_to_indices.get(sp, [])
+            valid_d = [i for i in d_idx if i < len(written_d) and written_d[i]]
+            emb_d = (h5d["global_embeddings"][sorted(valid_d)]
+                     if valid_d else np.empty((0, 1536), dtype=np.float32))
+        else:
+            valid_d = []
+            emb_d = np.empty((0, 1536), dtype=np.float32)
+
+        # Concatenate
+        emb_parts = [e for e in [emb_p, emb_d] if len(e) > 0]
+        if not emb_parts:
+            species_models[sp] = {"n_components": 0, "n_samples": 0}
+            continue
+        emb = np.vstack(emb_parts) if len(emb_parts) > 1 else emb_parts[0]
+        valid = valid_p + valid_d
+
         if len(valid) < 2:
-            # Too few samples — single-component model
             species_models[sp] = {"n_components": 0, "n_samples": len(valid)}
             continue
-
-        # Load embeddings for this species
-        emb = global_emb[sorted(valid)]  # (n_s, 1536)
 
         # PCA
         n_comp_pca = min(pca_dim, emb.shape[0] - 1, emb.shape[1])
@@ -258,6 +351,8 @@ def cluster_within_species(cfg: dict, logger):
         }
 
     h5f.close()
+    if h5d is not None:
+        h5d.close()
 
     # Summary
     component_counts = [m["n_components"] for m in species_models.values()]
@@ -288,15 +383,36 @@ def cluster_within_species(cfg: dict, logger):
 # Main
 # ─────────────────────────────────────────────
 
+def parse_args():
+    p = argparse.ArgumentParser(add_help=False)
+    p.add_argument("--with-distill", action="store_true",
+                   help="Merge distill embeddings into clustering")
+    p.add_argument("--distill-h5", type=str, default=None,
+                   help="Path to distill_embeddings.h5 "
+                        "(default: outputs/embeddings/distill_embeddings.h5)")
+    known, _ = p.parse_known_args()
+    return known
+
+
 def main(cfg: dict):
+    args = parse_args()
     logger = setup_logging("cluster", cfg["outputs"]["logs_dir"])
     logger.info("Stage 2: Motif Discovery")
 
+    distill_h5 = None
+    if args.with_distill:
+        distill_h5 = args.distill_h5 or cfg["outputs"].get(
+            "distill_embeddings_h5", "outputs/embeddings/distill_embeddings.h5"
+        )
+        logger.info(f"Distill embeddings: {distill_h5}")
+
     logger.info("=== Level 1: Global Motif Discovery (HDBSCAN) ===")
-    prototypes, clusterer, reducer = cluster_global(cfg, logger)
+    prototypes, clusterer, reducer = cluster_global(cfg, logger,
+                                                    distill_h5=distill_h5)
 
     logger.info("=== Level 2: Within-Species Sub-Clustering (GMM) ===")
-    species_models = cluster_within_species(cfg, logger)
+    species_models = cluster_within_species(cfg, logger,
+                                            distill_h5=distill_h5)
 
     logger.info("Stage 2 complete")
 

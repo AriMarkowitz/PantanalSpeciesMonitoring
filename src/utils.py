@@ -11,17 +11,20 @@ def load_audio_segment(path: str, start_sec: float, end_sec: float,
                        sr: int = 32000) -> np.ndarray:
     """Load a segment from an audio file without loading the full file.
 
-    Returns mono float32 waveform at the file's native sample rate.
-    Assumes the file is already at the target sample rate.
+    Returns mono float32 waveform resampled to `sr` if needed.
     """
-    start_frame = int(start_sec * sr)
-    stop_frame = int(end_sec * sr)
-    audio, file_sr = sf.read(path, start=start_frame, stop=stop_frame,
-                             dtype="float32", always_2d=False)
-    if file_sr != sr:
-        raise ValueError(f"Expected {sr} Hz, got {file_sr} Hz for {path}")
+    info = sf.info(str(path))
+    file_sr = info.samplerate
+    # Use native sr for frame offsets when reading, then resample
+    start_frame = int(start_sec * file_sr)
+    stop_frame = int(end_sec * file_sr)
+    audio, _ = sf.read(path, start=start_frame, stop=stop_frame,
+                       dtype="float32", always_2d=False)
     if audio.ndim > 1:
         audio = audio.mean(axis=1)
+    if file_sr != sr:
+        import resampy
+        audio = resampy.resample(audio, file_sr, sr)
     return audio
 
 

@@ -69,9 +69,9 @@ if [[ "$BIRDSET_ENABLE" == "1" ]]; then
         fi
         BIRDSET_PYTHON="$BIRDSET_VENV_DIR/bin/python"
 
-        if ! "$BIRDSET_PYTHON" -c "import datasets, soundfile, tqdm" >/dev/null 2>&1; then
+        if ! "$BIRDSET_PYTHON" -c "import datasets, soundfile, tqdm, resampy" >/dev/null 2>&1; then
             "$BIRDSET_PYTHON" -m pip install --upgrade pip
-            "$BIRDSET_PYTHON" -m pip install "datasets<=3.6.0" soundfile tqdm
+            "$BIRDSET_PYTHON" -m pip install "datasets<=3.6.0" soundfile tqdm resampy
         fi
     else
         if ! python -c "import datasets" >/dev/null 2>&1; then
@@ -92,32 +92,55 @@ if [[ "$SKIP_EXISTING" == "1" ]]; then
 fi
 
 if [[ "$INAT_ENABLE" == "1" ]]; then
-    echo "[1/2] Collecting iNat subset..."
-    "$INAT_PYTHON" src/scrape_distill_data.py \
-        --inat \
-        --inat-max-files "$INAT_MAX_FILES" \
-        --inat-splits "$INAT_SPLITS" \
-        --inat-supercategories "$INAT_SUPERCATEGORIES" \
-        --bbox="$INAT_BBOX" \
-        --inat-min-duration "$INAT_MIN_DURATION" \
-        "${COMMON_ARGS[@]}"
+    # Skip iNat entirely if the manifest already has iNat rows
+    INAT_DONE=0
+    if [[ -f "$PROJECT_DIR/$MANIFEST_PATH" ]] && grep -q '^inat,' "$PROJECT_DIR/$MANIFEST_PATH" 2>/dev/null; then
+        INAT_COUNT=$(grep -c '^inat,' "$PROJECT_DIR/$MANIFEST_PATH" || true)
+        echo "[1/2] iNat already collected ($INAT_COUNT rows in manifest) — skipping."
+        INAT_DONE=1
+    fi
+
+    if [[ "$INAT_DONE" == "0" ]]; then
+        echo "[1/2] Collecting iNat subset..."
+        "$INAT_PYTHON" src/scrape_distill_data.py \
+            --inat \
+            --inat-max-files "$INAT_MAX_FILES" \
+            --inat-splits "$INAT_SPLITS" \
+            --inat-supercategories "$INAT_SUPERCATEGORIES" \
+            --bbox="$INAT_BBOX" \
+            --inat-min-duration "$INAT_MIN_DURATION" \
+            "${COMMON_ARGS[@]}"
+    fi
 fi
 
 if [[ "$BIRDSET_ENABLE" == "1" ]]; then
-    echo "[2/2] Collecting BirdSet subset..."
-    BIRDSET_ARGS=(
-        --birdset
-        --birdset-config "$BIRDSET_CONFIG"
-        --birdset-split "$BIRDSET_SPLIT"
-        --birdset-max-files "$BIRDSET_MAX_FILES"
-    )
-    if [[ -n "$BIRDSET_ALLOWLIST" ]]; then
-        BIRDSET_ARGS+=(--birdset-species-allowlist "$BIRDSET_ALLOWLIST")
+    # Skip BirdSet entirely if it already has enough rows in the manifest
+    BIRDSET_DONE=0
+    if [[ -f "$PROJECT_DIR/$MANIFEST_PATH" ]] && grep -q '^birdset,' "$PROJECT_DIR/$MANIFEST_PATH" 2>/dev/null; then
+        BIRDSET_COUNT=$(grep -c '^birdset,' "$PROJECT_DIR/$MANIFEST_PATH" || true)
+        if [[ "$BIRDSET_COUNT" -ge "$BIRDSET_MAX_FILES" ]]; then
+            echo "[2/2] BirdSet already collected ($BIRDSET_COUNT rows in manifest, target=$BIRDSET_MAX_FILES) — skipping."
+            BIRDSET_DONE=1
+        else
+            echo "[2/2] BirdSet partially collected ($BIRDSET_COUNT/$BIRDSET_MAX_FILES rows) — resuming..."
+        fi
     fi
 
-    "$BIRDSET_PYTHON" src/scrape_distill_data.py \
-        "${BIRDSET_ARGS[@]}" \
-        "${COMMON_ARGS[@]}"
+    if [[ "$BIRDSET_DONE" == "0" ]]; then
+        BIRDSET_ARGS=(
+            --birdset
+            --birdset-config "$BIRDSET_CONFIG"
+            --birdset-split "$BIRDSET_SPLIT"
+            --birdset-max-files "$BIRDSET_MAX_FILES"
+        )
+        if [[ -n "$BIRDSET_ALLOWLIST" ]]; then
+            BIRDSET_ARGS+=(--birdset-species-allowlist "$BIRDSET_ALLOWLIST")
+        fi
+
+        "$BIRDSET_PYTHON" src/scrape_distill_data.py \
+            "${BIRDSET_ARGS[@]}" \
+            "${COMMON_ARGS[@]}"
+    fi
 fi
 
 echo "Distillation data scrape complete (job=${SLURM_JOB_ID:-N/A})."

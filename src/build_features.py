@@ -46,15 +46,23 @@ def load_species_gmms(proto_dir: str):
         return pickle.load(f)
 
 
+def _l2_normalize(x: np.ndarray, axis: int = -1, eps: float = 1e-8):
+    """L2-normalize along an axis."""
+    norms = np.linalg.norm(x, axis=axis, keepdims=True)
+    return x / np.maximum(norms, eps)
+
+
 def compute_global_motif_features(spatial_emb: np.ndarray,
                                   prototypes: np.ndarray,
-                                  temperature: float = 1.0):
+                                  temperature: float = 1.0,
+                                  metric: str = "cosine"):
     """Compute soft motif assignment features for one segment.
 
     Args:
         spatial_emb: (5, 3, 1536) or (15, 1536) spatial embeddings
         prototypes: (K, 1536) global prototypes
         temperature: softmax temperature
+        metric: "cosine" (default) or "euclidean"
 
     Returns:
         motif_histogram: (K,)
@@ -65,22 +73,26 @@ def compute_global_motif_features(spatial_emb: np.ndarray,
     local = spatial_emb.reshape(-1, spatial_emb.shape[-1])  # (15, 1536)
     K = prototypes.shape[0]
 
-    # Compute pairwise squared distances: (15, K)
-    # ||z - p||^2 = ||z||^2 + ||p||^2 - 2*z·p
-    z_sq = np.sum(local ** 2, axis=1, keepdims=True)  # (15, 1)
-    p_sq = np.sum(prototypes ** 2, axis=1, keepdims=True).T  # (1, K)
-    dists = z_sq + p_sq - 2.0 * local @ prototypes.T  # (15, K)
+    if metric == "cosine":
+        # Cosine similarity: natural for contrastive embeddings like Perch
+        local_n = _l2_normalize(local, axis=1)      # (15, 1536)
+        proto_n = _l2_normalize(prototypes, axis=1)  # (K, 1536)
+        sim = local_n @ proto_n.T                     # (15, K) in [-1, 1]
+        logits = sim / temperature
+    else:
+        # Euclidean (squared) distance — negate so closer = higher
+        z_sq = np.sum(local ** 2, axis=1, keepdims=True)
+        p_sq = np.sum(prototypes ** 2, axis=1, keepdims=True).T
+        dists = z_sq + p_sq - 2.0 * local @ prototypes.T
+        logits = -dists / temperature
 
-    # Soft assignment via temperature-scaled softmax over clusters
-    logits = -dists / temperature
     weights = softmax(logits, axis=1)  # (15, K)
 
     motif_histogram = weights.sum(axis=0)  # (K,)
     max_activation = weights.max(axis=0)   # (K,)
     temporal_spread = weights.std(axis=0)  # (K,)
 
-    # Noise fraction: how spread out is the assignment?
-    # High entropy across all clusters = likely noise
+    # Noise fraction: high entropy across all clusters = likely noise
     avg_entropy = np.mean([entropy(w) for w in weights])
     max_possible_entropy = np.log(K) if K > 1 else 1.0
     noise_fraction = avg_entropy / max_possible_entropy
@@ -285,7 +297,9 @@ def main(cfg: dict):
             spatial_emb = global_emb.reshape(1, -1)  # fallback
 
         hist, max_act, spread, noise = compute_global_motif_features(
-            spatial_emb, prototypes
+            spatial_emb, prototypes,
+            temperature=cfg["stage3"].get("temperature", 0.1),
+            metric=cfg["stage3"].get("similarity_metric", "cosine"),
         )
 
         # Sub-cluster features
@@ -322,6 +336,106 @@ def main(cfg: dict):
     h5_out.close()
 
     logger.info(f"Features complete: {N} segments, {feat_dim}D → {out_path}")
+
+    # Diagnostic: cluster→species association table
+    # Reopens embeddings HDF5 read-only for a second pass over labeled data
+    build_cluster_species_table(segments, labels, label_map, prototypes,
+                                h5_emb_path=cfg["outputs"]["embeddings_h5"],
+                                out_dir=Path(cfg["outputs"]["prototypes_dir"]),
+                                logger=logger,
+                                metric=cfg["stage3"].get("similarity_metric", "cosine"),
+                                temperature=cfg["stage3"].get("temperature", 0.1))
+
+    logger.info("Stage 3 complete")
+
+
+def build_cluster_species_table(segments: pd.DataFrame,
+                                labels: np.ndarray,
+                                label_map: dict,
+                                prototypes: np.ndarray,
+                                h5_emb_path: str,
+                                out_dir: Path,
+                                logger,
+                                metric: str = "cosine",
+                                temperature: float = 0.1):
+    """Build P(species | cluster) table for diagnostics.
+
+    For each global motif cluster, counts how often each species appears
+    in segments that strongly activate that cluster. This is NOT used for
+    classification (the MLP handles that nonlinearly), but for:
+      - Sanity checking that clusters capture biologically meaningful structure
+      - Debugging classifier failures
+      - Giving ecologists an interpretable cluster→species view
+    """
+    logger.info("Building cluster→species association table")
+
+    K = prototypes.shape[0]
+    num_species = labels.shape[1]
+    inv_label_map = {v: k for k, v in label_map.items()}
+
+    h5f = h5py.File(h5_emb_path, "r")
+    written = h5f["written"][:]
+    has_spatial = "spatial_embeddings" in h5f
+
+    # Accumulate: for each cluster, sum up the species label vectors
+    # of segments where that cluster has the highest activation
+    cluster_species_counts = np.zeros((K, num_species), dtype=np.float64)
+
+    # Only use labeled segments
+    labeled_mask = labels.sum(axis=1) > 0
+    labeled_indices = np.where(labeled_mask & written)[0]
+
+    logger.info(f"  Computing dominant cluster for {len(labeled_indices)} labeled segments")
+
+    for i in tqdm(labeled_indices, desc="Cluster-species table", mininterval=5.0):
+        if has_spatial:
+            spatial = h5f["spatial_embeddings"][i]  # (5, 3, 1536)
+            local = spatial.reshape(-1, spatial.shape[-1])  # (15, 1536)
+        else:
+            local = h5f["global_embeddings"][i].reshape(1, -1)
+
+        # Compute soft assignment (same metric as feature extraction)
+        if metric == "cosine":
+            local_n = _l2_normalize(local, axis=1)
+            proto_n = _l2_normalize(prototypes, axis=1)
+            sim = local_n @ proto_n.T
+            weights = softmax(sim / temperature, axis=1)
+        else:
+            dists = np.sum((local[:, None, :] - prototypes[None, :, :]) ** 2, axis=2)
+            weights = softmax(-dists / temperature, axis=1)
+
+        # Aggregate: motif histogram for this segment
+        hist = weights.sum(axis=0)  # (K,)
+
+        # Weight species labels by motif histogram
+        # Each cluster gets credit proportional to its activation
+        cluster_species_counts += np.outer(hist, labels[i])
+
+    h5f.close()
+
+    # Normalize to P(species | cluster)
+    row_sums = cluster_species_counts.sum(axis=1, keepdims=True)
+    row_sums = np.maximum(row_sums, 1e-10)
+    cluster_species_probs = cluster_species_counts / row_sums
+
+    # Save full matrix
+    np.savez(out_dir / "cluster_species_table.npz",
+             counts=cluster_species_counts,
+             probs=cluster_species_probs,
+             species_names=np.array([inv_label_map.get(i, str(i))
+                                     for i in range(num_species)]))
+
+    # Log top species per cluster
+    logger.info("  Top species per cluster:")
+    for k in range(min(K, 20)):  # show first 20
+        top_idx = np.argsort(cluster_species_probs[k])[::-1][:3]
+        top_str = ", ".join(
+            f"{inv_label_map.get(j, j)}={cluster_species_probs[k, j]:.2f}"
+            for j in top_idx if cluster_species_probs[k, j] > 0.01
+        )
+        logger.info(f"    Cluster {k:3d} (n={cluster_species_counts[k].sum():.0f}): {top_str}")
+
+    logger.info(f"  Saved to {out_dir / 'cluster_species_table.npz'}")
 
 
 if __name__ == "__main__":
