@@ -103,7 +103,7 @@ def compute_global_motif_features(spatial_emb: np.ndarray,
 def compute_species_subcluster_features(global_emb: np.ndarray,
                                         species_gmms: dict,
                                         label_map: dict):
-    """Compute per-species sub-cluster match features.
+    """Compute per-species sub-cluster match features for a single segment.
 
     Args:
         global_emb: (1536,) global embedding for one segment
@@ -111,7 +111,7 @@ def compute_species_subcluster_features(global_emb: np.ndarray,
         label_map: {species_id: index}
 
     Returns:
-        best_match: (num_species,) best sub-cluster log-likelihood per species
+        best_match: (num_species,) best sub-cluster posterior per species
         sub_entropy: (num_species,) entropy of sub-cluster posteriors per species
     """
     num_species = len(label_map)
@@ -132,10 +132,56 @@ def compute_species_subcluster_features(global_emb: np.ndarray,
             gmm = model["gmm"]
             reduced = pca.transform(emb_2d)
             posteriors = gmm.predict_proba(reduced)[0]  # (K_s,)
-            # Best match: max posterior
             best_match[idx] = posteriors.max()
-            # Entropy of sub-cluster assignment
             sub_entropy[idx] = entropy(posteriors + 1e-10)
+        except Exception:
+            continue
+
+    return best_match, sub_entropy
+
+
+def compute_all_subcluster_features_batched(
+    global_embs: np.ndarray,
+    species_gmms: dict,
+    label_map: dict,
+    logger=None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Vectorized per-species GMM scoring over all N segments at once.
+
+    Instead of calling pca.transform+gmm.predict_proba N×234 times (83M
+    sklearn calls at ~28h), this loops over 234 species and for each one
+    batch-processes all N embeddings in a single sklearn call.
+
+    Args:
+        global_embs: (N, 1536) all global embeddings (valid segments only;
+                     caller stores valid_indices for scatter-back)
+        species_gmms: {species_id: {"pca": PCA, "gmm": GMM, ...}}
+        label_map: {species_id: index}
+
+    Returns:
+        best_match: (N, num_species) float32
+        sub_entropy: (N, num_species) float32
+    """
+    N = global_embs.shape[0]
+    num_species = len(label_map)
+    best_match = np.full((N, num_species), -100.0, dtype=np.float32)
+    sub_entropy = np.zeros((N, num_species), dtype=np.float32)
+
+    for sp, idx in tqdm(label_map.items(), desc="GMM species", total=num_species,
+                        leave=False):
+        if sp not in species_gmms:
+            continue
+        model = species_gmms[sp]
+        if model["n_components"] == 0 or "gmm" not in model or model["gmm"] is None:
+            continue
+
+        try:
+            pca = model["pca"]
+            gmm = model["gmm"]
+            reduced = pca.transform(global_embs)          # (N, pca_dim)
+            posteriors = gmm.predict_proba(reduced)        # (N, K_s)
+            best_match[:, idx] = posteriors.max(axis=1)
+            sub_entropy[:, idx] = entropy(posteriors.T + 1e-10)  # entropy over K_s
         except Exception:
             continue
 
@@ -260,6 +306,21 @@ def main(cfg: dict):
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
     N = len(segments)
 
+    # ── Batched GMM scoring (vectorized over all valid segments) ──────────────
+    # Load all valid global embeddings into RAM once, then score all species
+    # in 234 batch sklearn calls instead of N×234 per-segment calls (~200x faster).
+    valid_indices = np.where(written)[0]
+    logger.info(f"Loading {len(valid_indices)} valid global embeddings for batched GMM scoring")
+    global_embs_valid = h5_emb["global_embeddings"][sorted(valid_indices)]  # (M, 1536)
+
+    logger.info("Running batched species GMM scoring (vectorized)")
+    gmm_best_match_valid, gmm_sub_ent_valid = compute_all_subcluster_features_batched(
+        global_embs_valid, species_gmms, label_map, logger=logger
+    )  # (M, num_species) each
+
+    # Build scatter-back lookup: original index → position in valid array
+    valid_pos = {int(idx): pos for pos, idx in enumerate(sorted(valid_indices))}
+
     logger.info(f"Creating features HDF5: {out_path}")
     h5_out = h5py.File(out_path, "w")
     feat_ds = h5_out.create_dataset(
@@ -278,42 +339,38 @@ def main(cfg: dict):
     h5_out.attrs["top_k_logits"] = top_k
     h5_out.attrs["feat_dim"] = feat_dim
 
-    # Process all segments
+    # Process all segments — GMM features already computed, just look up
+    temperature = cfg["stage3"].get("temperature", 0.1)
+    metric = cfg["stage3"].get("similarity_metric", "cosine")
+
     logger.info("Computing feature vectors")
     for i in tqdm(range(N), desc="Features"):
         seg_ids[i] = segments.iloc[i]["segment_id"]
 
         if not written[i]:
-            # Embedding not available — leave as zeros
             continue
 
-        # Global embedding
         global_emb = h5_emb["global_embeddings"][i]  # (1536,)
 
-        # Motif features
         if has_spatial:
             spatial_emb = h5_emb["spatial_embeddings"][i]  # (5, 3, 1536)
         else:
-            spatial_emb = global_emb.reshape(1, -1)  # fallback
+            spatial_emb = global_emb.reshape(1, -1)
 
         hist, max_act, spread, noise = compute_global_motif_features(
-            spatial_emb, prototypes,
-            temperature=cfg["stage3"].get("temperature", 0.1),
-            metric=cfg["stage3"].get("similarity_metric", "cosine"),
+            spatial_emb, prototypes, temperature=temperature, metric=metric,
         )
 
-        # Sub-cluster features
-        best_match, sub_ent = compute_species_subcluster_features(
-            global_emb, species_gmms, label_map
-        )
+        # Look up pre-computed GMM features for this segment
+        pos = valid_pos[i]
+        best_match = gmm_best_match_valid[pos]
+        sub_ent = gmm_sub_ent_valid[pos]
 
-        # Perch logits
         if has_logits:
-            logit_vals = h5_emb["logit_values"][i].astype(np.float32)  # (top_k,)
+            logit_vals = h5_emb["logit_values"][i].astype(np.float32)
         else:
             logit_vals = np.zeros(top_k, dtype=np.float32)
 
-        # Concatenate
         feat = np.concatenate([
             global_emb,        # 1536
             hist,              # K_global
@@ -327,7 +384,6 @@ def main(cfg: dict):
 
         feat_ds[i] = feat
 
-        # Flush periodically
         if i % 5000 == 0 and i > 0:
             h5_out.flush()
 

@@ -11,17 +11,25 @@ Primary source support:
   2) BirdSet (optional; via Hugging Face datasets package)
 
 Examples:
-  # iNat only, Pantanal-ish bbox, frogs+insects+mammals+reptiles + tropical birds
+  # iNat only, Pantanal bbox
     python src/scrape_distill_data.py \
     --output-dir data/distill_audio \
     --manifest-path data/distill_manifest.csv \
-    --inat \
-    --inat-max-files 8000 \
+    --inat --inat-max-files 30000 \
     --inat-supercategories aves,amphibia,insecta,mammalia,reptilia \
-        --bbox=-25,-60,-10,-45 \
+    --bbox=-22,-62,-10,-44 --skip-existing
+
+  # BirdSet geographic streaming — all 10 configs, Pantanal bbox, quality filter
+  python src/scrape_distill_data.py \
+    --output-dir data/distill_audio \
+    --manifest-path data/distill_manifest.csv \
+    --birdset-geo \
+    --birdset-configs PER,NES,UHH,HSN,NBP,POW,SSW,SNE,XCM,XCL \
+    --birdset-geo-max-per-config 5000 \
+    --train-csv data/train.csv \
     --skip-existing
 
-  # Add BirdSet PER subset (requires: pip install datasets)
+  # Add BirdSet PER subset (non-streaming, legacy)
   python src/scrape_distill_data.py \
     --output-dir data/distill_audio \
     --manifest-path data/distill_manifest.csv \
@@ -209,19 +217,35 @@ def _safe_float(x: Any):
 
 
 def load_ebird_taxonomy(cache_dir: Path, logger: logging.Logger) -> dict[str, dict[str, str]]:
-    """Download (once) and parse the eBird taxonomy CSV.
+    """Load eBird taxonomy CSV.
 
-    Returns a dict: ebird_code (lowercase 6-letter) -> {"scientific_name": ..., "common_name": ...}
+    Search order:
+      1. Any ebird_taxonomy*.csv / eBird_taxonomy*.csv in cache_dir
+      2. data/ directory relative to cwd (where user may have placed it manually)
+      3. Download from Cornell (may be blocked on HPC — use local copy instead)
+
+    Returns a dict: ebird_code (lowercase) -> {"scientific_name": ..., "common_name": ...}
     """
     cache_dir.mkdir(parents=True, exist_ok=True)
-    cache_path = cache_dir / "ebird_taxonomy_v2024.csv"
 
-    if not cache_path.exists():
-        logger.info(f"Downloading eBird taxonomy → {cache_path}")
-        data = _download_small_file(EBIRD_TAXONOMY_URL)
-        cache_path.write_bytes(data)
+    # Collect candidate paths: cache_dir first, then data/
+    search_dirs = [cache_dir, Path("data")]
+    cache_path = None
+    for d in search_dirs:
+        for p in sorted(d.glob("*[eE][bB]ird_taxonomy*.csv"), reverse=True):
+            cache_path = p
+            break
+        if cache_path:
+            break
+
+    if cache_path and cache_path.exists():
+        logger.info(f"Using local eBird taxonomy: {cache_path}")
     else:
-        logger.info(f"Using cached eBird taxonomy: {cache_path}")
+        dest = cache_dir / "ebird_taxonomy_v2024.csv"
+        logger.info(f"Downloading eBird taxonomy → {dest}")
+        data = _download_small_file(EBIRD_TAXONOMY_URL)
+        dest.write_bytes(data)
+        cache_path = dest
 
     mapping: dict[str, dict[str, str]] = {}
     with cache_path.open("r", encoding="utf-8-sig", newline="") as f:
@@ -563,6 +587,257 @@ def collect_birdset(
     logger.info(f"BirdSet complete: extracted={count}, manifest_rows_added={len(new_rows)}")
 
 
+def load_train_xc_ids(train_csv_path: Path | None, logger: logging.Logger) -> set[str]:
+    """Parse XC IDs from the competition train.csv filename column.
+
+    BirdSet source_ids look like 'XC123456'. We strip the 'XC' prefix and
+    store bare integer strings for fast lookup.
+
+    Returns a set of XC id strings (bare integers, e.g. {"123456", "78901"}).
+    """
+    if train_csv_path is None or not train_csv_path.exists():
+        logger.info("No train.csv provided or not found — skipping XC ID dedup")
+        return set()
+
+    xc_ids: set[str] = set()
+    with train_csv_path.open("r", newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        fname_col = next(
+            (c for c in (reader.fieldnames or []) if c.lower() in ("filename", "file_name")),
+            None,
+        )
+        if fname_col is None:
+            logger.warning("train.csv has no 'filename' column — skipping XC ID dedup")
+            return set()
+        for row in reader:
+            fname = Path(row[fname_col]).stem  # e.g. "XC123456" or "XC123456.ogg"
+            bare = fname.upper().lstrip("XC").lstrip("0") or "0"
+            xc_ids.add(bare)
+            # also store with leading zeros stripped and the raw form
+            xc_ids.add(fname.upper().replace("XC", "").replace("xc", ""))
+
+    logger.info(f"Loaded {len(xc_ids)} XC IDs from train.csv for dedup")
+    return xc_ids
+
+
+def _extract_xc_id(filepath: str) -> str | None:
+    """Extract the bare XC integer string from a BirdSet filepath field.
+
+    BirdSet filepaths look like: 'XC123456.ogg', 'xc123456', or just '123456'.
+    Returns the bare integer string (stripped of 'XC' prefix and leading zeros).
+    """
+    if not filepath:
+        return None
+    stem = Path(filepath).stem.upper()
+    bare = stem.lstrip("XC").lstrip("0") or "0"
+    return bare
+
+
+def collect_birdset_streaming_geo(
+    output_dir: Path,
+    manifest_path: Path,
+    dedup: DedupIndex,
+    configs: list[str],
+    split: str,
+    bbox: tuple[float, float, float, float],
+    max_per_config: int,
+    require_detected_events: bool,
+    ebird_taxonomy: dict[str, dict[str, str]],
+    train_xc_ids: set[str],
+    skip_existing: bool,
+    logger: logging.Logger,
+    no_bbox_configs: set[str] | None = None,
+):
+    """Stream all BirdSet configs with geographic bbox filter + quality filter.
+
+    Key differences from collect_birdset():
+    - Streams all configs; no full dataset download
+    - Geographic filter applied per-example before any decode
+    - Pre-embed XC ID dedup: skip examples whose XC ID is in train.csv
+    - Quality filter: prefer clips with detected_events (vocalization timestamps)
+      when require_detected_events=True; fall back to all clips otherwise
+    - No random per-species cap — keeps all geographically-relevant clips
+
+    Args:
+        bbox: (min_lat, min_lon, max_lat, max_lon)
+        require_detected_events: if True, skip clips with empty detected_events
+        train_xc_ids: set of bare XC integer strings from train.csv
+        no_bbox_configs: config names that skip the bbox filter entirely
+            (e.g. {"PER", "NES"} — region-specific datasets where every clip
+            is relevant regardless of coordinates)
+    """
+    if no_bbox_configs is None:
+        no_bbox_configs = set()
+    try:
+        from datasets import load_dataset
+    except ImportError as e:
+        raise RuntimeError("Missing optional dependency: datasets. pip install datasets") from e
+
+    # Route HF cache to /tmp to avoid filling home quota with shard downloads
+    import os as _os
+    hf_cache = _os.environ.get("HF_DATASETS_CACHE") or _os.environ.get("HF_HOME")
+    if not hf_cache:
+        _os.environ["HF_DATASETS_CACHE"] = "/tmp/hf_datasets_cache"
+        logger.info("Routing HF datasets cache → /tmp/hf_datasets_cache")
+
+    output_base = output_dir / "birdset"
+    output_base.mkdir(parents=True, exist_ok=True)
+    target_sr = 32000
+    seg_dur = 5.0  # seconds — extract one 5s window per clip
+
+    total_written = 0
+
+    for config_name in configs:
+        logger.info(f"Streaming BirdSet {config_name}/{split} with geo filter bbox={bbox}")
+        try:
+            ds = load_dataset(
+                "DBD-research-group/BirdSet", config_name,
+                split=split, streaming=True, trust_remote_code=True,
+            )
+        except Exception as e:
+            logger.warning(f"Could not load BirdSet {config_name}: {e} — skipping")
+            continue
+
+        # Build int→ebird_code map for this config
+        int2ebird = build_birdset_label_map(config_name, split, logger)
+
+        new_rows: list[dict] = []
+        count = 0
+        skip_geo = config_name in no_bbox_configs
+        if skip_geo:
+            logger.info(f"  {config_name}: bbox filter disabled (region-specific config)")
+
+        for ex in tqdm(ds, desc=f"birdset-{config_name}", disable=not _os.isatty(1)):
+            if count >= max_per_config:
+                break
+
+            # ── Geographic filter (cheap, no decode) ────────────────────────
+            lat = ex.get("lat") or ex.get("latitude")
+            lon = ex.get("long") or ex.get("longitude")
+            if not skip_geo and not _in_bbox(lat, lon, bbox):
+                continue
+
+            # ── XC ID dedup against train.csv ────────────────────────────────
+            filepath = str(ex.get("filepath", ""))
+            xc_id = _extract_xc_id(filepath)
+            if xc_id and xc_id in train_xc_ids:
+                continue
+
+            # ── Quality filter: require detected_events ──────────────────────
+            det_events = ex.get("detected_events") or []
+            if require_detected_events and not det_events:
+                continue
+
+            # ── Source ID dedup against manifest ────────────────────────────
+            source_id = f"birdset:{config_name}:{split}:{filepath or count}"
+            if skip_existing and source_id in dedup.source_ids:
+                continue
+
+            # ── Audio decode ─────────────────────────────────────────────────
+            audio_field = ex.get("audio")
+            if not isinstance(audio_field, dict):
+                continue
+            raw_bytes = audio_field.get("bytes")
+            if not raw_bytes:
+                continue
+
+            try:
+                arr, sr = sf.read(io.BytesIO(raw_bytes), dtype="float32", always_2d=False)
+            except Exception as e:
+                logger.debug(f"soundfile decode failed ({config_name} ex {count}): {e}")
+                continue
+            if arr.ndim > 1:
+                arr = arr.mean(axis=1)
+
+            if sr != target_sr:
+                try:
+                    import resampy
+                    arr = resampy.resample(arr, sr, target_sr)
+                except ImportError:
+                    from scipy.signal import resample_poly
+                    import math
+                    g = math.gcd(target_sr, sr)
+                    arr = resample_poly(arr, target_sr // g, sr // g).astype("float32")
+                sr = target_sr
+
+            # ── Extract 5s window around first detected_events timestamp ─────
+            # detected_events entries look like {"start_time": 1.2, "end_time": 3.7, ...}
+            # or may just be floats. Fall back to start of clip if no timestamps.
+            event_start = 0.0
+            if det_events:
+                first = det_events[0]
+                if isinstance(first, dict):
+                    event_start = float(first.get("start_time") or first.get("start") or 0.0)
+                elif isinstance(first, (int, float)):
+                    event_start = float(first)
+
+            # Center the 5s window on the event, clamped to clip boundaries
+            clip_dur = len(arr) / sr
+            win_start = max(0.0, min(event_start - seg_dur / 2, clip_dur - seg_dur))
+            win_start = max(0.0, win_start)
+            s0 = int(win_start * sr)
+            s1 = s0 + int(seg_dur * sr)
+            segment = arr[s0:s1]
+
+            # Zero-pad if clip is shorter than 5s
+            target_len = int(seg_dur * sr)
+            if len(segment) < target_len:
+                import numpy as _np
+                segment = _np.pad(segment, (0, target_len - len(segment)))
+
+            # ── Resolve ebird code ───────────────────────────────────────────
+            raw_ebird = ex.get("ebird_code")
+            if isinstance(raw_ebird, int) and int2ebird:
+                ebird_code = int2ebird.get(raw_ebird, "")
+            else:
+                ebird_code = str(raw_ebird or "").lower()
+
+            tax = ebird_taxonomy.get(ebird_code, {})
+
+            # ── Write 5s OGG segment (compressed, ~150KB vs ~5MB WAV) ────────
+            basename = Path(filepath).stem if filepath else f"sample_{count}"
+            out_name = f"birdset_{config_name}_{split}_{basename}.ogg"
+            out_path = output_base / config_name / split / out_name
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+
+            if skip_existing and out_path.name in dedup.basenames:
+                continue
+
+            sf.write(str(out_path), segment, sr, format="OGG", subtype="VORBIS")
+            sha1 = _sha1_path(out_path)
+
+            if skip_existing and sha1 in dedup.hashes:
+                out_path.unlink(missing_ok=True)
+                continue
+
+            rel_out = out_path.relative_to(output_dir)
+            row = {
+                "source": "birdset",
+                "source_split": split,
+                "source_id": source_id,
+                "species_name": tax.get("scientific_name") or ebird_code,
+                "common_name": tax.get("common_name", ""),
+                "supercategory": "aves",
+                "latitude": _safe_float(lat),
+                "longitude": _safe_float(lon),
+                "duration_sec": seg_dur,
+                "sample_rate": sr,
+                "relative_path": str(rel_out),
+                "sha1": sha1,
+            }
+            new_rows.append(row)
+            dedup.source_ids.add(source_id)
+            dedup.hashes.add(sha1)
+            dedup.basenames.add(out_path.name)
+            count += 1
+
+        append_manifest_rows(manifest_path, new_rows)
+        total_written += count
+        logger.info(f"BirdSet {config_name}: {count} clips written")
+
+    logger.info(f"BirdSet geo-streaming complete: {total_written} total clips across {len(configs)} configs")
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Filtered distillation data collector (iNat + BirdSet)")
     p.add_argument("--output-dir", type=str, default="data/distill_audio")
@@ -587,21 +862,60 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--inat-min-duration", type=float, default=2.0)
 
-    p.add_argument("--birdset", action="store_true", help="Enable BirdSet collection")
+    p.add_argument("--birdset", action="store_true", help="Enable BirdSet collection (legacy single-config, non-streaming)")
     p.add_argument(
         "--birdset-configs",
         type=str,
         default="PER",
-        help="Comma-separated BirdSet config names, e.g. PER,NES",
+        help="Comma-separated BirdSet config names (used by both --birdset and --birdset-geo)",
     )
     p.add_argument("--birdset-split", type=str, default="train")
-    p.add_argument("--birdset-max-files", type=int, default=3000, help="Max files per config")
+    p.add_argument("--birdset-max-files", type=int, default=3000, help="Max files per config (legacy --birdset)")
     p.add_argument("--birdset-species-allowlist", type=str, default="")
+
+    # Geographic streaming mode (preferred)
+    p.add_argument(
+        "--birdset-geo",
+        action="store_true",
+        help="Enable multi-config geographic streaming (all configs in --birdset-configs, bbox filtered)",
+    )
+    p.add_argument(
+        "--birdset-geo-max-per-config",
+        type=int,
+        default=5000,
+        help="Max clips per BirdSet config in geo-streaming mode",
+    )
+    p.add_argument(
+        "--birdset-geo-bbox",
+        type=str,
+        default="-22,-62,-10,-44",
+        help="Pantanal bbox: min_lat,min_lon,max_lat,max_lon (default: Pantanal region)",
+    )
+    p.add_argument(
+        "--birdset-require-detected-events",
+        action="store_true",
+        default=True,
+        help="In geo mode, only keep clips that have detected_events annotations",
+    )
+    p.add_argument(
+        "--birdset-no-bbox-configs",
+        type=str,
+        default="PER,NES",
+        help="Comma-separated configs that skip the bbox filter (region-specific datasets "
+             "where every clip is relevant). Default: PER,NES",
+    )
+    p.add_argument(
+        "--train-csv",
+        type=str,
+        default="data/train.csv",
+        help="Path to competition train.csv for pre-embed XC ID dedup",
+    )
+
     p.add_argument(
         "--taxonomy-cache-dir",
         type=str,
-        default="data/taxonomy_cache",
-        help="Directory to cache downloaded eBird taxonomy CSV",
+        default="data",
+        help="Directory containing or to cache eBird taxonomy CSV (searches for eBird_taxonomy*.csv)",
     )
     p.add_argument(
         "--repair-manifest",
@@ -611,12 +925,82 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def repair_manifest_birdset_labels(
+    manifest_path: Path,
+    ebird_taxonomy: dict[str, dict[str, str]],
+    logger: logging.Logger,
+):
+    """Fix existing BirdSet manifest rows where species_name is an integer label index.
+
+    Builds int→ebird_code maps per config from the ClassLabel feature, then rewrites
+    species_name/common_name for any row where species_name looks like a raw integer.
+    """
+    if not manifest_path.exists():
+        logger.warning("Manifest not found, nothing to repair.")
+        return
+
+    rows: list[dict[str, Any]] = []
+    with manifest_path.open("r", newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        rows = list(reader)
+
+    # Collect which BirdSet configs need a label map
+    configs_needed: set[str] = set()
+    for row in rows:
+        if row.get("source") != "birdset":
+            continue
+        val = row.get("species_name", "").strip()
+        if val.lstrip("-").isdigit():
+            # Extract config from source_id: "birdset:PER:train:..."
+            parts = row.get("source_id", "").split(":")
+            if len(parts) >= 2:
+                configs_needed.add(parts[1])
+
+    if not configs_needed:
+        logger.info("No integer BirdSet labels found — manifest is already clean.")
+        return
+
+    logger.info(f"Repairing BirdSet labels for configs: {configs_needed}")
+    int2ebird_by_config: dict[str, dict[int, str]] = {}
+    for cfg in configs_needed:
+        int2ebird_by_config[cfg] = build_birdset_label_map(cfg, "train", logger)
+
+    repaired = 0
+    for row in rows:
+        if row.get("source") != "birdset":
+            continue
+        val = row.get("species_name", "").strip()
+        if not val.lstrip("-").isdigit():
+            continue
+
+        parts = row.get("source_id", "").split(":")
+        cfg = parts[1] if len(parts) >= 2 else ""
+        int2ebird = int2ebird_by_config.get(cfg, {})
+        ebird_code = int2ebird.get(int(val), "")
+        if not ebird_code:
+            continue
+
+        tax = ebird_taxonomy.get(ebird_code.lower(), {})
+        row["species_name"] = tax.get("scientific_name") or ebird_code
+        row["common_name"] = tax.get("common_name", "")
+        repaired += 1
+
+    # Rewrite manifest in place
+    with manifest_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=MANIFEST_COLUMNS)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    logger.info(f"Repaired {repaired} BirdSet rows in {manifest_path}")
+
+
 def main():
     args = build_parser().parse_args()
     logger = setup_logger(args.log_level)
 
     output_dir = Path(args.output_dir).resolve()
     manifest_path = Path(args.manifest_path).resolve()
+    taxonomy_cache_dir = Path(args.taxonomy_cache_dir).resolve()
 
     output_dir.mkdir(parents=True, exist_ok=True)
     ensure_manifest(manifest_path)
@@ -626,8 +1010,16 @@ def main():
         f"hashes={len(dedup.hashes)}, basenames={len(dedup.basenames)}"
     )
 
-    if not args.inat and not args.birdset:
-        raise ValueError("Nothing to do: set at least one of --inat or --birdset")
+    if not args.inat and not args.birdset and not args.birdset_geo and not args.repair_manifest:
+        raise ValueError("Nothing to do: set at least one of --inat, --birdset, --birdset-geo, or --repair-manifest")
+
+    # Load eBird taxonomy once if BirdSet or repair is requested
+    ebird_taxonomy: dict[str, dict[str, str]] = {}
+    if args.birdset or args.birdset_geo or args.repair_manifest:
+        ebird_taxonomy = load_ebird_taxonomy(taxonomy_cache_dir, logger)
+
+    if args.repair_manifest:
+        repair_manifest_birdset_labels(manifest_path, ebird_taxonomy, logger)
 
     if args.inat:
         inat_splits = [s.strip() for s in args.inat_splits.split(",") if s.strip()]
@@ -653,16 +1045,44 @@ def main():
 
     if args.birdset:
         allowlist_path = Path(args.birdset_species_allowlist).resolve() if args.birdset_species_allowlist else None
-        collect_birdset(
+        birdset_configs = [c.strip() for c in args.birdset_configs.split(",") if c.strip()]
+        for config_name in birdset_configs:
+            collect_birdset(
+                output_dir=output_dir,
+                manifest_path=manifest_path,
+                dedup=dedup,
+                config_name=config_name,
+                split=args.birdset_split,
+                max_files=args.birdset_max_files,
+                species_allowlist_path=allowlist_path,
+                ebird_taxonomy=ebird_taxonomy,
+                skip_existing=args.skip_existing,
+                logger=logger,
+            )
+
+    if args.birdset_geo:
+        birdset_configs = [c.strip() for c in args.birdset_configs.split(",") if c.strip()]
+        geo_bbox = _parse_bbox(args.birdset_geo_bbox)
+        train_csv_path = Path(args.train_csv).resolve() if args.train_csv else None
+        train_xc_ids = load_train_xc_ids(train_csv_path, logger)
+
+        no_bbox_configs = {
+            c.strip() for c in args.birdset_no_bbox_configs.split(",") if c.strip()
+        }
+        collect_birdset_streaming_geo(
             output_dir=output_dir,
             manifest_path=manifest_path,
             dedup=dedup,
-            config_name=args.birdset_config,
+            configs=birdset_configs,
             split=args.birdset_split,
-            max_files=args.birdset_max_files,
-            species_allowlist_path=allowlist_path,
+            bbox=geo_bbox,
+            max_per_config=args.birdset_geo_max_per_config,
+            require_detected_events=args.birdset_require_detected_events,
+            ebird_taxonomy=ebird_taxonomy,
+            train_xc_ids=train_xc_ids,
             skip_existing=args.skip_existing,
             logger=logger,
+            no_bbox_configs=no_bbox_configs,
         )
 
     logger.info(f"Done. Manifest: {manifest_path}")

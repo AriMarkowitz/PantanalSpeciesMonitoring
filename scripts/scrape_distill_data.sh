@@ -25,14 +25,25 @@ INAT_SUPERCATEGORIES="${INAT_SUPERCATEGORIES:-aves,amphibia,insecta,mammalia,rep
 INAT_BBOX="${INAT_BBOX:--25,-60,-10,-45}"
 INAT_MIN_DURATION="${INAT_MIN_DURATION:-2.0}"
 
-# BirdSet defaults
+# BirdSet defaults — geo streaming mode (preferred)
 BIRDSET_ENABLE="${BIRDSET_ENABLE:-1}"
-BIRDSET_CONFIG="${BIRDSET_CONFIG:-PER}"
+# All 10 configs; geo-streaming filters to Pantanal bbox before downloading
+BIRDSET_CONFIGS="${BIRDSET_CONFIGS:-PER,NES,UHH,HSN,NBP,POW,SSW,SNE,XCM,XCL}"
 BIRDSET_SPLIT="${BIRDSET_SPLIT:-train}"
+BIRDSET_GEO_MAX_PER_CONFIG="${BIRDSET_GEO_MAX_PER_CONFIG:-5000}"   # per config, geo-filtered
+BIRDSET_GEO_BBOX="${BIRDSET_GEO_BBOX:--22,-62,-10,-44}"            # Pantanal region
+BIRDSET_REQUIRE_DETECTED_EVENTS="${BIRDSET_REQUIRE_DETECTED_EVENTS:-1}"
+# PER and NES are region-specific configs — take all clips, no bbox filter needed
+BIRDSET_NO_BBOX_CONFIGS="${BIRDSET_NO_BBOX_CONFIGS:-PER,NES}"
+TRAIN_CSV="${TRAIN_CSV:-data/train.csv}"
+# Legacy non-geo mode settings (only used if BIRDSET_GEO_MODE=0)
 BIRDSET_MAX_FILES="${BIRDSET_MAX_FILES:-3000}"
 BIRDSET_ALLOWLIST="${BIRDSET_ALLOWLIST:-}"
+BIRDSET_GEO_MODE="${BIRDSET_GEO_MODE:-1}"
 BIRDSET_ISOLATED="${BIRDSET_ISOLATED:-1}"
 BIRDSET_VENV_DIR="${BIRDSET_VENV_DIR:-$PROJECT_DIR/.venv_birdset_scrape}"
+TAXONOMY_CACHE_DIR="${TAXONOMY_CACHE_DIR:-data}"
+REPAIR_MANIFEST="${REPAIR_MANIFEST:-0}"
 
 mkdir -p "$PROJECT_DIR/outputs/logs"
 
@@ -46,14 +57,25 @@ conda activate "$ENV_NAME"
 
 cd "$PROJECT_DIR"
 
+# Route HuggingFace cache to /tmp (scratch) to avoid filling home quota.
+# Each BirdSet config downloads ~3-4GB of shards that can be discarded after.
+export HF_DATASETS_CACHE="/tmp/hf_datasets_${SLURM_JOB_ID:-$$}"
+export HF_HOME="/tmp/hf_home_${SLURM_JOB_ID:-$$}"
+mkdir -p "$HF_DATASETS_CACHE" "$HF_HOME"
+echo "HF cache → $HF_DATASETS_CACHE"
+
 echo "Job ID: ${SLURM_JOB_ID:-N/A}"
 echo "Node: ${SLURM_NODELIST:-N/A}"
 echo "Python: $(python --version)"
 echo "Output dir: $OUTPUT_DIR"
 echo "Manifest: $MANIFEST_PATH"
-echo "iNat enabled: $INAT_ENABLE"
-echo "BirdSet enabled: $BIRDSET_ENABLE"
+echo "iNat enabled: $INAT_ENABLE (max=$INAT_MAX_FILES, bbox=$INAT_BBOX)"
+echo "BirdSet enabled: $BIRDSET_ENABLE (configs: $BIRDSET_CONFIGS)"
+echo "BirdSet geo mode: $BIRDSET_GEO_MODE (bbox=$BIRDSET_GEO_BBOX, max/config=$BIRDSET_GEO_MAX_PER_CONFIG)"
+echo "BirdSet require detected_events: $BIRDSET_REQUIRE_DETECTED_EVENTS"
+echo "Train CSV for XC dedup: $TRAIN_CSV"
 echo "BirdSet isolated venv: $BIRDSET_ISOLATED"
+echo "Repair manifest: $REPAIR_MANIFEST"
 echo "---"
 
 # BirdSet path requires datasets package.
@@ -84,11 +106,20 @@ fi
 COMMON_ARGS=(
     --output-dir "$OUTPUT_DIR"
     --manifest-path "$MANIFEST_PATH"
+    --taxonomy-cache-dir "$TAXONOMY_CACHE_DIR"
     --log-level INFO
 )
 
 if [[ "$SKIP_EXISTING" == "1" ]]; then
     COMMON_ARGS+=(--skip-existing)
+fi
+
+# ── Step 0: Repair existing manifest BirdSet labels if requested ──────────────
+if [[ "$REPAIR_MANIFEST" == "1" ]]; then
+    echo "[0/2] Repairing BirdSet integer labels in manifest..."
+    "$BIRDSET_PYTHON" src/scrape_distill_data.py \
+        --repair-manifest \
+        "${COMMON_ARGS[@]}"
 fi
 
 if [[ "$INAT_ENABLE" == "1" ]]; then
@@ -114,32 +145,56 @@ if [[ "$INAT_ENABLE" == "1" ]]; then
 fi
 
 if [[ "$BIRDSET_ENABLE" == "1" ]]; then
-    # Skip BirdSet entirely if it already has enough rows in the manifest
-    BIRDSET_DONE=0
-    if [[ -f "$PROJECT_DIR/$MANIFEST_PATH" ]] && grep -q '^birdset,' "$PROJECT_DIR/$MANIFEST_PATH" 2>/dev/null; then
-        BIRDSET_COUNT=$(grep -c '^birdset,' "$PROJECT_DIR/$MANIFEST_PATH" || true)
-        if [[ "$BIRDSET_COUNT" -ge "$BIRDSET_MAX_FILES" ]]; then
-            echo "[2/2] BirdSet already collected ($BIRDSET_COUNT rows in manifest, target=$BIRDSET_MAX_FILES) — skipping."
-            BIRDSET_DONE=1
-        else
-            echo "[2/2] BirdSet partially collected ($BIRDSET_COUNT/$BIRDSET_MAX_FILES rows) — resuming..."
-        fi
+    BIRDSET_COUNT=0
+    if [[ -f "$PROJECT_DIR/$MANIFEST_PATH" ]]; then
+        BIRDSET_COUNT=$(grep -c '^birdset,' "$PROJECT_DIR/$MANIFEST_PATH" 2>/dev/null || true)
     fi
 
-    if [[ "$BIRDSET_DONE" == "0" ]]; then
+    if [[ "$BIRDSET_GEO_MODE" == "1" ]]; then
+        # ── Geographic streaming mode (preferred) ──────────────────────────
+        N_CONFIGS=$(echo "$BIRDSET_CONFIGS" | tr ',' '\n' | wc -l)
+        BIRDSET_TARGET=$(( BIRDSET_GEO_MAX_PER_CONFIG * N_CONFIGS ))
+        echo "[2/2] BirdSet geo-streaming: configs=$BIRDSET_CONFIGS, target~$BIRDSET_TARGET clips"
+
         BIRDSET_ARGS=(
-            --birdset
-            --birdset-config "$BIRDSET_CONFIG"
+            --birdset-geo
+            --birdset-configs "$BIRDSET_CONFIGS"
             --birdset-split "$BIRDSET_SPLIT"
-            --birdset-max-files "$BIRDSET_MAX_FILES"
+            --birdset-geo-max-per-config "$BIRDSET_GEO_MAX_PER_CONFIG"
+            --birdset-geo-bbox="$BIRDSET_GEO_BBOX"
+            --train-csv "$TRAIN_CSV"
         )
-        if [[ -n "$BIRDSET_ALLOWLIST" ]]; then
-            BIRDSET_ARGS+=(--birdset-species-allowlist "$BIRDSET_ALLOWLIST")
+        if [[ "$BIRDSET_REQUIRE_DETECTED_EVENTS" == "1" ]]; then
+            BIRDSET_ARGS+=(--birdset-require-detected-events)
+        fi
+        if [[ -n "$BIRDSET_NO_BBOX_CONFIGS" ]]; then
+            BIRDSET_ARGS+=(--birdset-no-bbox-configs "$BIRDSET_NO_BBOX_CONFIGS")
         fi
 
         "$BIRDSET_PYTHON" src/scrape_distill_data.py \
             "${BIRDSET_ARGS[@]}" \
             "${COMMON_ARGS[@]}"
+    else
+        # ── Legacy non-streaming mode ──────────────────────────────────────
+        N_CONFIGS=$(echo "$BIRDSET_CONFIGS" | tr ',' '\n' | wc -l)
+        BIRDSET_TARGET=$(( BIRDSET_MAX_FILES * N_CONFIGS ))
+        if [[ "$BIRDSET_COUNT" -ge "$BIRDSET_TARGET" ]]; then
+            echo "[2/2] BirdSet already collected ($BIRDSET_COUNT rows, target=$BIRDSET_TARGET) — skipping."
+        else
+            echo "[2/2] BirdSet (legacy): $BIRDSET_COUNT/$BIRDSET_TARGET rows, resuming..."
+            BIRDSET_ARGS=(
+                --birdset
+                --birdset-configs "$BIRDSET_CONFIGS"
+                --birdset-split "$BIRDSET_SPLIT"
+                --birdset-max-files "$BIRDSET_MAX_FILES"
+            )
+            if [[ -n "$BIRDSET_ALLOWLIST" ]]; then
+                BIRDSET_ARGS+=(--birdset-species-allowlist "$BIRDSET_ALLOWLIST")
+            fi
+            "$BIRDSET_PYTHON" src/scrape_distill_data.py \
+                "${BIRDSET_ARGS[@]}" \
+                "${COMMON_ARGS[@]}"
+        fi
     fi
 fi
 

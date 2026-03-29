@@ -134,6 +134,7 @@ def cluster_global(cfg: dict, logger, distill_h5: str | None = None):
 
     # UMAP dimensionality reduction
     umap_dim = gcfg["umap_dim"]
+    emb_dim = all_local.shape[1]
     logger.info(f"UMAP reduction: {emb_dim}D → {umap_dim}D")
     reducer = umap.UMAP(n_components=umap_dim, n_neighbors=30, min_dist=0.0,
                         metric="cosine", random_state=42, verbose=True)
