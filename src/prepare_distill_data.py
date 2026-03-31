@@ -135,6 +135,15 @@ def process_distill_manifest(
         source_type = str(mrow.get("source", "distill")).lower()
         segments = segment_file(audio_path, duration, seg_dur, overlap)
 
+        # event_start_sec from manifest: timestamp of the first vocalization.
+        # Passed through to distill_segments.csv so the embedder can center
+        # its 9s context window on the vocalization rather than the segment midpoint.
+        raw_event = mrow.get("event_start_sec")
+        try:
+            event_start_sec = float(raw_event) if raw_event != "" and pd.notna(raw_event) else None
+        except (TypeError, ValueError):
+            event_start_sec = None
+
         for start, end in segments:
             # Silence filter (optional)
             if not skip_silence_filter:
@@ -157,6 +166,7 @@ def process_distill_manifest(
                 "secondary_labels": "",
                 "is_labeled": is_labeled,
                 "label_quality": label_quality,
+                "event_start_sec": event_start_sec if event_start_sec is not None else "",
             })
 
     logger.info(

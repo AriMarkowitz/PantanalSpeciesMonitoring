@@ -64,7 +64,7 @@ def _load_spatial_sample(h5f, written, subsample_n, rng, logger):
     """Return a (M, 1536) array sampled from spatial or global embeddings."""
     valid_indices = np.where(written)[0]
     has_spatial = "spatial_embeddings" in h5f
-    n_per_segment = 15 if has_spatial else 1
+    n_per_segment = 5 if has_spatial else 1  # 5 frames per 9s context window
 
     n_needed = subsample_n // n_per_segment + 1
     if n_needed >= len(valid_indices):

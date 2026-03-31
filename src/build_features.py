@@ -410,11 +410,8 @@ def main(cfg: dict):
     global_embs_all = h5_emb["global_embeddings"][valid_idx_sorted]  # (M, 1536)
 
     if has_spatial:
-        spatial_embs_all = h5_emb["spatial_embeddings"][valid_idx_sorted]  # (M, 5, 3, 1536) or (M, 15, 1536)
-        # Flatten spatial dims to (M, L, 1536)
-        sp = spatial_embs_all
-        if sp.ndim == 4:
-            sp = sp.reshape(sp.shape[0], -1, sp.shape[-1])
+        spatial_embs_all = h5_emb["spatial_embeddings"][valid_idx_sorted]  # (M, N_SPATIAL_FRAMES, 1536)
+        sp = spatial_embs_all  # already (M, L, 1536)
     else:
         sp = global_embs_all[:, np.newaxis, :]  # (M, 1, 1536)
 
@@ -552,9 +549,9 @@ def build_cluster_species_table(segments: pd.DataFrame,
         # Aggregate: motif histogram for this segment
         hist = weights.sum(axis=0)  # (K,)
 
-        # Weight species labels by motif histogram
-        # Each cluster gets credit proportional to its activation
-        cluster_species_counts += np.outer(hist, labels[i])
+        # Credit only the dominant cluster for this segment
+        dominant = int(hist.argmax())
+        cluster_species_counts[dominant] += labels[i]
 
     h5f.close()
 

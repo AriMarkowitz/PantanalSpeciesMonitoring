@@ -23,27 +23,59 @@ from utils import load_audio_segment, setup_logging
 
 
 def init_perch(model_name: str, logger):
-    """Load Perch model. Imports tensorflow only when needed."""
+    """Load Perch model with hop_size=1s for multi-frame spatial embeddings.
+
+    With window_size_s=5.0 and hop_size_s=1.0, passing a 9s context window
+    yields 5 frames: shape (T=5, 1, 1536). We squeeze the channel dim to
+    store (T=5, 1536) as spatial embeddings.
+    """
     logger.info(f"Loading Perch model: {model_name}")
     from perch_hoplite.zoo import model_configs
     model = model_configs.load_model_by_name(model_name)
-    logger.info("Perch model loaded successfully")
+    # Override hop to get multi-frame output from a longer context window
+    model.hop_size_s = 1.0
+    logger.info(f"Perch loaded: window={model.window_size_s}s hop={model.hop_size_s}s")
     return model
 
 
-def embed_batch(model, waveforms: list[np.ndarray], logger):
-    """Run Perch on a batch of waveforms.
+# Context window around each 5s segment: pass this many extra seconds on
+# each side so that batch_embed produces N_SPATIAL_FRAMES frames.
+# With window=5s, hop=1s: n_frames = floor((context_s - window_s) / hop_s) + 1
+# context=9s → floor((9-5)/1)+1 = 5 frames
+N_SPATIAL_FRAMES = 5
+CONTEXT_S = 9.0   # seconds to load around each 5s segment
 
-    Returns dicts with 'embedding', 'spatial', 'logits' arrays.
-    Perch's embed() is per-sample, so we loop (model is already on GPU).
+
+def embed_batch(model, waveforms: list[np.ndarray], sr: int, logger):
+    """Run Perch on a batch of context waveforms, returning spatial embeddings.
+
+    Each waveform should be ~CONTEXT_S seconds. Perch batch_embed with
+    hop_size_s=1.0 produces shape (batch, T, 1, 1536).
+    We return:
+      - spatial: (T, 1536)  — T frames, channel dim squeezed
+      - global:  (1536,)    — mean-pool over T frames
+      - logits:  dict or None
     """
     results = []
     for wav in waveforms:
         try:
-            outputs = model.embed(wav)
+            out = model.batch_embed(wav[np.newaxis, :])  # (1, T, 1, 1536)
+            emb = np.asarray(out.embeddings, dtype=np.float32)  # (1, T, 1, D)
+            emb = emb[0, :, 0, :]  # (T, D) — drop batch and channel dims
+            T = emb.shape[0]
+            # Derive global from real frames only (before any zero-fill)
+            real_frames = emb[:min(T, N_SPATIAL_FRAMES)]
+            global_emb = real_frames.mean(axis=0)  # (D,)
+            # Trim or zero-fill to fill the fixed HDF5 slot (trailing zeros are
+            # not used for global; clustering uses global_emb)
+            if T > N_SPATIAL_FRAMES:
+                emb = emb[:N_SPATIAL_FRAMES]
+            elif T < N_SPATIAL_FRAMES:
+                emb = np.pad(emb, ((0, N_SPATIAL_FRAMES - T), (0, 0)))
             results.append({
-                "embedding": np.asarray(outputs.embeddings, dtype=np.float32),
-                "logits": outputs.logits,
+                "spatial": emb,          # (N_SPATIAL_FRAMES, 1536)
+                "global": global_emb,    # (1536,)
+                "logits": out.logits,
             })
         except Exception as e:
             logger.warning(f"Embed failed for waveform shape {wav.shape}: {e}")
@@ -98,9 +130,9 @@ def create_h5(path: str, n_segments: int, cfg: dict):
         if cfg["stage1"]["store_spatial"]:
             f.create_dataset(
                 "spatial_embeddings",
-                shape=(n_segments, 5, 3, 1536),
+                shape=(n_segments, N_SPATIAL_FRAMES, 1536),
                 dtype="float32",
-                chunks=(min(100, n_segments), 5, 3, 1536),
+                chunks=(min(100, n_segments), N_SPATIAL_FRAMES, 1536),
                 compression="lzf",
             )
         if cfg["stage1"]["store_logits"]:
@@ -174,22 +206,37 @@ def main(cfg: dict):
                                 desc="Embedding"):
             batch_idx = todo_indices[batch_start:batch_start + batch_size]
 
-            # Load audio
+            # Load audio — use 9s context window so that batch_embed with
+            # hop=1s produces N_SPATIAL_FRAMES frames.
+            # Center on event_start_sec (vocalization timestamp from manifest)
+            # if available, otherwise center on the 5s segment midpoint.
+            # No zero-padding: if the clip is shorter than 9s, pass what we
+            # have — Perch will produce fewer frames, which we pad in embed_batch.
+            context_half = CONTEXT_S / 2.0  # 4.5s each side of center
             waveforms = []
             valid_idx = []
             for i in batch_idx:
                 row = segments.iloc[i]
                 try:
+                    # Prefer event_start_sec as context center (distill data);
+                    # fall back to segment midpoint (primary soundscape data).
+                    raw_event = row.get("event_start_sec") if hasattr(row, "get") else None
+                    try:
+                        event_sec = float(raw_event) if raw_event not in (None, "", float("nan")) else None
+                    except (TypeError, ValueError):
+                        event_sec = None
+                    center = event_sec if event_sec is not None else (row["start_sec"] + row["end_sec"]) / 2.0
+                    ctx_start = max(0.0, center - context_half)
+                    ctx_end = center + context_half
                     wav = load_audio_segment(
-                        row["source_file"], row["start_sec"],
-                        row["end_sec"], sr
+                        row["source_file"], ctx_start, ctx_end, sr
                     )
-                    # Pad or trim to exact segment length
-                    expected_len = int(seg_dur * sr)
-                    if len(wav) < expected_len:
-                        wav = np.pad(wav, (0, expected_len - len(wav)))
-                    elif len(wav) > expected_len:
-                        wav = wav[:expected_len]
+                    if len(wav) == 0:
+                        continue
+                    # Trim to CONTEXT_S if longer (never pad — fewer frames is fine)
+                    max_len = int(CONTEXT_S * sr)
+                    if len(wav) > max_len:
+                        wav = wav[:max_len]
                     waveforms.append(wav)
                     valid_idx.append(i)
                 except Exception as e:
@@ -200,33 +247,17 @@ def main(cfg: dict):
                 continue
 
             # Run Perch
-            results = embed_batch(model, waveforms, logger)
+            results = embed_batch(model, waveforms, sr, logger)
 
             # Write to HDF5
             for idx, result in zip(valid_idx, results):
                 if result is None:
                     continue
 
-                emb = result["embedding"]
-
-                # Handle global vs spatial embedding shapes
-                if emb.ndim == 3 and emb.shape == (5, 3, 1536):
-                    # Perch returned spatial; derive global by mean-pooling
-                    if cfg["stage1"]["store_spatial"]:
-                        h5f["spatial_embeddings"][idx] = emb
-                    global_emb = emb.mean(axis=(0, 1))
-                    h5f["global_embeddings"][idx] = global_emb
-                elif emb.ndim == 1 and emb.shape[0] == 1536:
-                    h5f["global_embeddings"][idx] = emb
-                else:
-                    # Try to handle other shapes
-                    flat = emb.ravel()
-                    if len(flat) == 1536:
-                        h5f["global_embeddings"][idx] = flat
-                    else:
-                        logger.warning(f"Unexpected embedding shape {emb.shape} "
-                                       f"for segment {idx}")
-                        continue
+                # embed_batch returns {"spatial": (T, 1536), "global": (1536,), "logits": ...}
+                h5f["global_embeddings"][idx] = result["global"]
+                if cfg["stage1"]["store_spatial"]:
+                    h5f["spatial_embeddings"][idx] = result["spatial"]  # (N_SPATIAL_FRAMES, 1536)
 
                 # Logits
                 if cfg["stage1"]["store_logits"] and result["logits"] is not None:

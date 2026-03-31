@@ -64,6 +64,17 @@ export HF_HOME="/tmp/hf_home_${SLURM_JOB_ID:-$$}"
 mkdir -p "$HF_DATASETS_CACHE" "$HF_HOME"
 echo "HF cache → $HF_DATASETS_CACHE"
 
+# Pass HF token if set in environment (avoids rate-limit warnings in isolated venv)
+if [[ -n "${HF_TOKEN:-}" ]]; then
+    export HF_TOKEN
+    echo "HF_TOKEN: set (authenticated)"
+elif [[ -f "$HOME/.cache/huggingface/token" ]]; then
+    export HF_TOKEN="$(cat "$HOME/.cache/huggingface/token")"
+    echo "HF_TOKEN: loaded from ~/.cache/huggingface/token"
+else
+    echo "HF_TOKEN: not set (unauthenticated — rate limits may apply)"
+fi
+
 echo "Job ID: ${SLURM_JOB_ID:-N/A}"
 echo "Node: ${SLURM_NODELIST:-N/A}"
 echo "Python: $(python --version)"

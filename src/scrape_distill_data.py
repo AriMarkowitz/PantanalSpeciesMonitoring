@@ -88,6 +88,7 @@ MANIFEST_COLUMNS = [
     "sample_rate",
     "relative_path",
     "sha1",
+    "event_start_sec",  # timestamp of first vocalization event (used by embedder for context window)
 ]
 
 
@@ -711,7 +712,6 @@ def collect_birdset_streaming_geo(
     output_base = output_dir / "birdset"
     output_base.mkdir(parents=True, exist_ok=True)
     target_sr = 32000
-    seg_dur = 5.0  # seconds — extract one 5s window per clip
 
     total_written = 0
 
@@ -731,6 +731,7 @@ def collect_birdset_streaming_geo(
 
         new_rows: list[dict] = []
         count = 0
+        examined = 0
         skip_geo = config_name in no_bbox_configs
         if skip_geo:
             logger.info(f"  {config_name}: bbox filter disabled (region-specific config)")
@@ -738,6 +739,10 @@ def collect_birdset_streaming_geo(
         for ex in tqdm(ds, desc=f"birdset-{config_name}", disable=not _os.isatty(1)):
             if count >= max_per_config:
                 break
+
+            examined += 1
+            if examined % 500 == 0:
+                logger.info(f"  {config_name}: examined={examined}, saved={count}/{max_per_config}")
 
             # ── Geographic filter (cheap, no decode) ────────────────────────
             lat = ex.get("lat") or ex.get("latitude")
@@ -788,31 +793,6 @@ def collect_birdset_streaming_geo(
                     arr = resample_poly(arr, target_sr // g, sr // g).astype("float32")
                 sr = target_sr
 
-            # ── Extract 5s window around first detected_events timestamp ─────
-            # detected_events entries look like {"start_time": 1.2, "end_time": 3.7, ...}
-            # or may just be floats. Fall back to start of clip if no timestamps.
-            event_start = 0.0
-            if det_events:
-                first = det_events[0]
-                if isinstance(first, dict):
-                    event_start = float(first.get("start_time") or first.get("start") or 0.0)
-                elif isinstance(first, (int, float)):
-                    event_start = float(first)
-
-            # Center the 5s window on the event, clamped to clip boundaries
-            clip_dur = len(arr) / sr
-            win_start = max(0.0, min(event_start - seg_dur / 2, clip_dur - seg_dur))
-            win_start = max(0.0, win_start)
-            s0 = int(win_start * sr)
-            s1 = s0 + int(seg_dur * sr)
-            segment = arr[s0:s1]
-
-            # Zero-pad if clip is shorter than 5s
-            target_len = int(seg_dur * sr)
-            if len(segment) < target_len:
-                import numpy as _np
-                segment = _np.pad(segment, (0, target_len - len(segment)))
-
             # ── Resolve ebird code ───────────────────────────────────────────
             raw_ebird = ex.get("ebird_code")
             if isinstance(raw_ebird, int) and int2ebird:
@@ -822,7 +802,37 @@ def collect_birdset_streaming_geo(
 
             tax = ebird_taxonomy.get(ebird_code, {})
 
-            # ── Write 5s OGG segment (compressed, ~150KB vs ~5MB WAV) ────────
+            # ── Record event_start for the embedder to use as context center ──
+            # detected_events entries look like {"start_time": 1.2, "end_time": 3.7}
+            # or may just be floats. Fall back to None if no timestamps.
+            event_start = None
+            if det_events:
+                first = det_events[0]
+                if isinstance(first, dict):
+                    t = first.get("start_time") or first.get("start")
+                    if t is not None:
+                        event_start = float(t)
+                elif isinstance(first, (int, float)):
+                    event_start = float(first)
+
+            clip_dur = len(arr) / sr
+
+            # ── Trim to MAX_CLIP_S centered on vocalization ──────────────────
+            # BirdSet clips can be many minutes long. We only need enough audio
+            # for a 9s embedding context window. Cap at 15s to stay disk-efficient
+            # while giving the embedder real context (not a 5s stub).
+            MAX_CLIP_S = 15.0
+            if clip_dur > MAX_CLIP_S:
+                center = event_start if event_start is not None else clip_dur / 2.0
+                half = MAX_CLIP_S / 2.0
+                s0 = int(max(0.0, center - half) * sr)
+                s1 = s0 + int(MAX_CLIP_S * sr)
+                arr = arr[s0:s1]
+                clip_dur = len(arr) / sr
+                # Adjust event_start relative to the new clip start
+                if event_start is not None:
+                    event_start = max(0.0, event_start - (s0 / sr))
+
             basename = Path(filepath).stem if filepath else f"sample_{count}"
             out_name = f"birdset_{config_name}_{split}_{basename}.ogg"
             out_path = output_base / config_name / split / out_name
@@ -831,7 +841,7 @@ def collect_birdset_streaming_geo(
             if skip_existing and out_path.name in dedup.basenames:
                 continue
 
-            sf.write(str(out_path), segment, sr, format="OGG", subtype="VORBIS")
+            sf.write(str(out_path), arr, sr, format="OGG", subtype="VORBIS")
             sha1 = _sha1_path(out_path)
 
             if skip_existing and sha1 in dedup.hashes:
@@ -848,10 +858,11 @@ def collect_birdset_streaming_geo(
                 "supercategory": "aves",
                 "latitude": _safe_float(lat),
                 "longitude": _safe_float(lon),
-                "duration_sec": seg_dur,
+                "duration_sec": clip_dur,
                 "sample_rate": sr,
                 "relative_path": str(rel_out),
                 "sha1": sha1,
+                "event_start_sec": event_start if event_start is not None else "",
             }
             new_rows.append(row)
             dedup.source_ids.add(source_id)
