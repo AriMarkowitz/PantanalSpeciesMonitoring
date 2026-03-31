@@ -16,7 +16,10 @@ import h5py
 from pathlib import Path
 from scipy.special import softmax
 from scipy.stats import entropy
+import sys
 from tqdm import tqdm
+
+_IN_TTY = sys.stdout.isatty()
 
 from config import get_config
 from utils import setup_logging, build_label_map, parse_soundscape_labels
@@ -98,6 +101,58 @@ def compute_global_motif_features(spatial_emb: np.ndarray,
     noise_fraction = avg_entropy / max_possible_entropy
 
     return motif_histogram, max_activation, temporal_spread, noise_fraction
+
+
+def compute_global_motif_features_batched(
+    spatial_embs: np.ndarray,
+    prototypes: np.ndarray,
+    temperature: float = 0.1,
+    metric: str = "cosine",
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Vectorized version of compute_global_motif_features over N segments.
+
+    Args:
+        spatial_embs: (N, 15, 1536) or (N, 1536) spatial embeddings
+        prototypes: (K, 1536) global prototypes
+
+    Returns:
+        hist:    (N, K)
+        max_act: (N, K)
+        spread:  (N, K)
+        noise:   (N,)
+    """
+    if spatial_embs.ndim == 2:
+        # global-only fallback: treat each segment as (1, 1536)
+        spatial_embs = spatial_embs[:, np.newaxis, :]  # (N, 1, 1536)
+
+    N, L, D = spatial_embs.shape  # L = number of local patches (15)
+    K = prototypes.shape[0]
+
+    # Flatten to (N*L, D), compute similarities, reshape back
+    local = spatial_embs.reshape(N * L, D)
+
+    if metric == "cosine":
+        local_n = local / (np.linalg.norm(local, axis=1, keepdims=True) + 1e-8)
+        proto_n = prototypes / (np.linalg.norm(prototypes, axis=1, keepdims=True) + 1e-8)
+        logits = (local_n @ proto_n.T) / temperature          # (N*L, K)
+    else:
+        z_sq = np.sum(local ** 2, axis=1, keepdims=True)
+        p_sq = np.sum(prototypes ** 2, axis=1, keepdims=True).T
+        dists = z_sq + p_sq - 2.0 * local @ prototypes.T
+        logits = -dists / temperature                          # (N*L, K)
+
+    weights = softmax(logits, axis=1).reshape(N, L, K)         # (N, L, K)
+
+    hist    = weights.sum(axis=1)                              # (N, K)
+    max_act = weights.max(axis=1)                              # (N, K)
+    spread  = weights.std(axis=1)                              # (N, K)
+
+    # Noise fraction per segment
+    avg_ent = -np.sum(weights * np.log(weights + 1e-10), axis=2).mean(axis=1)  # (N,)
+    max_ent = np.log(K) if K > 1 else 1.0
+    noise = avg_ent / max_ent                                  # (N,)
+
+    return hist, max_act, spread, noise
 
 
 def compute_species_subcluster_features(global_emb: np.ndarray,
@@ -343,49 +398,83 @@ def main(cfg: dict):
     temperature = cfg["stage3"].get("temperature", 0.1)
     metric = cfg["stage3"].get("similarity_metric", "cosine")
 
-    logger.info("Computing feature vectors")
-    for i in tqdm(range(N), desc="Features"):
-        seg_ids[i] = segments.iloc[i]["segment_id"]
+    # ── Segment IDs (vectorized, no .iloc loop) ──────────────────────────────
+    seg_id_vals = segments["segment_id"].values
+    for i, sid in enumerate(seg_id_vals):
+        seg_ids[i] = sid
 
-        if not written[i]:
-            continue
+    # ── Bulk-load all valid embeddings ────────────────────────────────────────
+    valid_idx_sorted = sorted(valid_indices)
+    logger.info(f"Loading spatial embeddings for {len(valid_idx_sorted)} valid segments")
 
-        global_emb = h5_emb["global_embeddings"][i]  # (1536,)
+    global_embs_all = h5_emb["global_embeddings"][valid_idx_sorted]  # (M, 1536)
 
-        if has_spatial:
-            spatial_emb = h5_emb["spatial_embeddings"][i]  # (5, 3, 1536)
-        else:
-            spatial_emb = global_emb.reshape(1, -1)
+    if has_spatial:
+        spatial_embs_all = h5_emb["spatial_embeddings"][valid_idx_sorted]  # (M, 5, 3, 1536) or (M, 15, 1536)
+        # Flatten spatial dims to (M, L, 1536)
+        sp = spatial_embs_all
+        if sp.ndim == 4:
+            sp = sp.reshape(sp.shape[0], -1, sp.shape[-1])
+    else:
+        sp = global_embs_all[:, np.newaxis, :]  # (M, 1, 1536)
 
-        hist, max_act, spread, noise = compute_global_motif_features(
-            spatial_emb, prototypes, temperature=temperature, metric=metric,
+    if has_logits:
+        logit_vals_all = h5_emb["logit_values"][valid_idx_sorted].astype(np.float32)  # (M, top_k)
+    else:
+        logit_vals_all = np.zeros((len(valid_idx_sorted), top_k), dtype=np.float32)
+
+    # ── Batched motif features ────────────────────────────────────────────────
+    logger.info("Computing motif features (batched)")
+    CHUNK = 4096  # process in chunks to bound peak memory
+    M = len(valid_idx_sorted)
+    hist_all    = np.empty((M, K_global), dtype=np.float32)
+    max_act_all = np.empty((M, K_global), dtype=np.float32)
+    spread_all  = np.empty((M, K_global), dtype=np.float32)
+    noise_all   = np.empty(M, dtype=np.float32)
+
+    for start in tqdm(range(0, M, CHUNK), desc="Motif chunks", disable=not _IN_TTY):
+        end = min(start + CHUNK, M)
+        h, ma, s, n = compute_global_motif_features_batched(
+            sp[start:end], prototypes, temperature=temperature, metric=metric,
         )
+        hist_all[start:end]    = h
+        max_act_all[start:end] = ma
+        spread_all[start:end]  = s
+        noise_all[start:end]   = n
 
-        # Look up pre-computed GMM features for this segment
-        pos = valid_pos[i]
-        best_match = gmm_best_match_valid[pos]
-        sub_ent = gmm_sub_ent_valid[pos]
+    # ── Assemble and write feature matrix ────────────────────────────────────
+    logger.info("Assembling and writing feature matrix")
+    feat_matrix = np.concatenate([
+        global_embs_all,       # (M, 1536)
+        hist_all,              # (M, K_global)
+        max_act_all,           # (M, K_global)
+        spread_all,            # (M, K_global)
+        noise_all[:, None],    # (M, 1)
+        gmm_best_match_valid,  # (M, num_species)
+        gmm_sub_ent_valid,     # (M, num_species)
+        logit_vals_all,        # (M, top_k)
+    ], axis=1).astype(np.float32)
 
-        if has_logits:
-            logit_vals = h5_emb["logit_values"][i].astype(np.float32)
-        else:
-            logit_vals = np.zeros(top_k, dtype=np.float32)
-
-        feat = np.concatenate([
-            global_emb,        # 1536
-            hist,              # K_global
-            max_act,           # K_global
-            spread,            # K_global
-            [noise],           # 1
-            best_match,        # num_species
-            sub_ent,           # num_species
-            logit_vals,        # top_k
-        ])
-
-        feat_ds[i] = feat
-
-        if i % 5000 == 0 and i > 0:
-            h5_out.flush()
+    # Write feature rows — use contiguous slice if all segments are valid (fast),
+    # otherwise fall back to chunked fancy indexing (slower but correct).
+    M = len(valid_idx_sorted)
+    logger.info(f"Writing {M} feature rows to HDF5")
+    all_contiguous = (M == N and valid_idx_sorted[0] == 0 and valid_idx_sorted[-1] == N - 1)
+    if all_contiguous:
+        logger.info("All segments valid — using contiguous slice write")
+        WRITE_CHUNK = 50000
+        for start in range(0, M, WRITE_CHUNK):
+            end = min(start + WRITE_CHUNK, M)
+            feat_ds[start:end] = feat_matrix[start:end]
+            logger.info(f"  wrote {end}/{M} rows")
+    else:
+        logger.info("Sparse valid segments — using chunked fancy-index write")
+        WRITE_CHUNK = 10000
+        for start in range(0, M, WRITE_CHUNK):
+            end = min(start + WRITE_CHUNK, M)
+            feat_ds[valid_idx_sorted[start:end], :] = feat_matrix[start:end]
+            logger.info(f"  wrote {end}/{M} rows")
+    h5_out.flush()
 
     h5_emb.close()
     h5_out.flush()
@@ -443,7 +532,7 @@ def build_cluster_species_table(segments: pd.DataFrame,
 
     logger.info(f"  Computing dominant cluster for {len(labeled_indices)} labeled segments")
 
-    for i in tqdm(labeled_indices, desc="Cluster-species table", mininterval=5.0):
+    for i in tqdm(labeled_indices, desc="Cluster-species table", disable=not _IN_TTY):
         if has_spatial:
             spatial = h5f["spatial_embeddings"][i]  # (5, 3, 1536)
             local = spatial.reshape(-1, spatial.shape[-1])  # (15, 1536)

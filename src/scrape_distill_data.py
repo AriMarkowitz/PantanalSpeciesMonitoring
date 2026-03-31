@@ -263,17 +263,45 @@ def load_ebird_taxonomy(cache_dir: Path, logger: logging.Logger) -> dict[str, di
 
 
 def build_birdset_label_map(config_name: str, split: str, logger: logging.Logger) -> dict[int, str]:
-    """Return {int_index: ebird_code_string} for a BirdSet config using its ClassLabel feature."""
+    """Return {int_index: ebird_code_string} for a BirdSet config using its ClassLabel feature.
+
+    Avoids download_and_prepare() which triggers full shard downloads (~hundreds of GB for
+    large configs like XCL). Instead reads the dataset_info.json from the HF hub directly.
+    """
+    # Strategy 1: read dataset_info.json from HF hub (no shard download needed)
+    try:
+        import json, urllib.request
+        url = (
+            f"https://huggingface.co/datasets/DBD-research-group/BirdSet"
+            f"/resolve/main/{config_name}/dataset_info.json"
+        )
+        with urllib.request.urlopen(url, timeout=30) as resp:
+            info = json.loads(resp.read())
+        features = info.get("features", {})
+        ebird_feature = features.get("ebird_code", {})
+        names = ebird_feature.get("names") or ebird_feature.get("class_label", {}).get("names")
+        if names:
+            result = {i: name for i, name in enumerate(names)}
+            logger.info(f"BirdSet {config_name} label map: {len(result)} classes (from hub metadata)")
+            return result
+    except Exception as e:
+        logger.debug(f"Could not fetch label map from hub for {config_name}: {e}")
+
+    # Strategy 2: load_dataset_builder inspect-only (downloads only dataset_info, not shards)
     try:
         from datasets import load_dataset_builder
-    except ImportError:
-        return {}
-
-    try:
         builder = load_dataset_builder("DBD-research-group/BirdSet", config_name, trust_remote_code=True)
-        builder.download_and_prepare()
+        # download_and_prepare() is NOT called — info is populated from dataset_info.json only
         features = builder.info.features
-        ebird_feature = features.get("ebird_code")
+        if features is None:
+            # Trigger metadata-only download (just the info file, not shards)
+            builder._download_and_prepare = lambda *a, **kw: None  # type: ignore[assignment]
+            try:
+                builder.download_and_prepare()
+            except Exception:
+                pass
+            features = builder.info.features
+        ebird_feature = features.get("ebird_code") if features else None
         if ebird_feature is not None and hasattr(ebird_feature, "names"):
             result = {i: name for i, name in enumerate(ebird_feature.names)}
             logger.info(f"BirdSet {config_name} label map: {len(result)} classes")
@@ -834,6 +862,34 @@ def collect_birdset_streaming_geo(
         append_manifest_rows(manifest_path, new_rows)
         total_written += count
         logger.info(f"BirdSet {config_name}: {count} clips written")
+
+        # ── Free /tmp shard cache for this config before moving to the next ──
+        # XCM/XCL have 98 shards × ~5GB each; without cleanup they fill /tmp.
+        del ds
+        import shutil as _shutil
+        freed_mb = 0
+        for cache_root in filter(None, [
+            _os.environ.get("HF_DATASETS_CACHE", ""),
+            _os.environ.get("HF_HOME", ""),
+        ]):
+            # HF layout: <cache>/datasets--DBD-research-group--BirdSet/
+            #   blobs/  partial-<hash>  (raw shard tarballs)
+            #   snapshots/  (extracted parquet/arrow files)
+            birdset_root = Path(cache_root) / "datasets--DBD-research-group--BirdSet"
+            if not birdset_root.exists():
+                # Also check hub/ subdir (HF_HOME layout)
+                birdset_root = Path(cache_root) / "hub" / "datasets--DBD-research-group--BirdSet"
+            if birdset_root.exists():
+                # Only delete blobs (raw shard tarballs) — keep snapshots/refs
+                # so the next config doesn't re-download shared metadata.
+                # Actually for /tmp we just nuke everything; it's all scratch.
+                try:
+                    size = sum(f.stat().st_size for f in birdset_root.rglob("*") if f.is_file())
+                    freed_mb = size // (1024 * 1024)
+                    _shutil.rmtree(birdset_root, ignore_errors=True)
+                except Exception:
+                    pass
+        logger.info(f"BirdSet {config_name}: HF shard cache purged (~{freed_mb} MB freed)")
 
     logger.info(f"BirdSet geo-streaming complete: {total_written} total clips across {len(configs)} configs")
 

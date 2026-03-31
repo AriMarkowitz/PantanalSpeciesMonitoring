@@ -16,11 +16,14 @@ Usage:
 
 import argparse
 import pickle
+import sys
 import numpy as np
 import pandas as pd
 import h5py
 from pathlib import Path
 from tqdm import tqdm
+
+_IN_TTY = sys.stdout.isatty()
 
 from config import get_config
 from utils import setup_logging, build_label_map, parse_soundscape_labels
@@ -282,7 +285,7 @@ def cluster_within_species(cfg: dict, logger, distill_h5: str | None = None):
     all_species = set(species_to_indices) | set(distill_species_to_indices)
     species_models = {}  # {species_id: {"pca": PCA, "gmm": GMM, "n_components": K}}
 
-    for sp in tqdm(all_species, desc="Within-species GMM"):
+    for sp in tqdm(all_species, desc="Within-species GMM", disable=not _IN_TTY):
         # Primary valid embeddings
         p_idx = species_to_indices.get(sp, [])
         valid_p = [i for i in p_idx if i < len(written) and written[i]]
@@ -391,6 +394,8 @@ def parse_args():
     p.add_argument("--distill-h5", type=str, default=None,
                    help="Path to distill_embeddings.h5 "
                         "(default: outputs/embeddings/distill_embeddings.h5)")
+    p.add_argument("--force", action="store_true",
+                   help="Rerun Stage 2 even if prototypes/GMMs already exist")
     known, _ = p.parse_known_args()
     return known
 
@@ -407,13 +412,20 @@ def main(cfg: dict):
         )
         logger.info(f"Distill embeddings: {distill_h5}")
 
-    logger.info("=== Level 1: Global Motif Discovery (HDBSCAN) ===")
-    prototypes, clusterer, reducer = cluster_global(cfg, logger,
-                                                    distill_h5=distill_h5)
+    proto_path = Path(cfg["outputs"]["prototypes_dir"]) / "global_prototypes.npz"
+    gmm_path   = Path(cfg["outputs"]["prototypes_dir"]) / "species_gmms.pkl"
 
-    logger.info("=== Level 2: Within-Species Sub-Clustering (GMM) ===")
-    species_models = cluster_within_species(cfg, logger,
-                                            distill_h5=distill_h5)
+    if proto_path.exists() and gmm_path.exists() and not args.__dict__.get("force", False):
+        logger.info("Stage 2 outputs already exist — skipping clustering (use --force to rerun)")
+        prototypes = np.load(proto_path)["prototypes"]
+    else:
+        logger.info("=== Level 1: Global Motif Discovery (HDBSCAN) ===")
+        prototypes, clusterer, reducer = cluster_global(cfg, logger,
+                                                        distill_h5=distill_h5)
+
+        logger.info("=== Level 2: Within-Species Sub-Clustering (GMM) ===")
+        species_models = cluster_within_species(cfg, logger,
+                                                distill_h5=distill_h5)
 
     logger.info("Stage 2 complete")
 
