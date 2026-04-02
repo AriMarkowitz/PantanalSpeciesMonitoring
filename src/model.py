@@ -1,4 +1,4 @@
-"""Model definitions: MLP classifier and masked focal loss."""
+"""Model definitions: MLP classifier, masked focal loss, and ASL."""
 
 import torch
 import torch.nn as nn
@@ -38,6 +38,47 @@ class MaskedFocalLoss(nn.Module):
         loss = focal_weight * bce * masks
 
         # Normalize by number of supervised entries (avoid div-by-zero)
+        n_supervised = masks.sum().clamp(min=1.0)
+        return loss.sum() / n_supervised
+
+
+class MaskedAsymmetricLoss(nn.Module):
+    """Asymmetric Loss (ASL) with per-sample, per-class masking.
+
+    From "Asymmetric Loss For Multi-Label Classification" (Ridnik et al. 2021).
+    Key idea: use different focusing parameters for positives vs negatives,
+    and apply hard thresholding on negative probabilities to suppress
+    easy negatives entirely. This is critical for multi-label problems
+    with heavy negative imbalance (234 species, most absent per segment).
+
+    Args:
+        gamma_pos: focusing parameter for positive samples (lower = less down-weighting)
+        gamma_neg: focusing parameter for negative samples (higher = more suppression of easy negatives)
+        clip: hard threshold for negative probability shifting. Probabilities below
+              this value are clamped to zero before computing the loss, eliminating
+              gradient signal from very easy negatives.
+    """
+
+    def __init__(self, gamma_pos: float = 0.0, gamma_neg: float = 4.0,
+                 clip: float = 0.05):
+        super().__init__()
+        self.gamma_pos = gamma_pos
+        self.gamma_neg = gamma_neg
+        self.clip = clip
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor,
+                masks: torch.Tensor) -> torch.Tensor:
+        prob = torch.sigmoid(logits)
+
+        # Negative probability shifting (hard thresholding)
+        prob_neg = prob.clamp(min=self.clip)
+
+        # Positive: -log(p) weighted by (1-p)^gamma_pos
+        # Negative: -log(1-p_shifted) weighted by p_shifted^gamma_neg
+        pos_loss = -targets * ((1.0 - prob) ** self.gamma_pos) * torch.log(prob.clamp(min=1e-8))
+        neg_loss = -(1.0 - targets) * (prob_neg ** self.gamma_neg) * torch.log((1.0 - prob_neg).clamp(min=1e-8))
+
+        loss = (pos_loss + neg_loss) * masks
         n_supervised = masks.sum().clamp(min=1.0)
         return loss.sum() / n_supervised
 

@@ -7,8 +7,8 @@
 #SBATCH --gres=gpu:1
 #SBATCH --mem=32G
 #SBATCH --time=2:00:00
-#SBATCH --output=outputs/logs/train_%j.log
-#SBATCH --error=outputs/logs/train_%j.log
+#SBATCH --output=/users/admarkowitz/PantanalSpeciesMonitoring/outputs/logs/train_%j.log
+#SBATCH --error=/users/admarkowitz/PantanalSpeciesMonitoring/outputs/logs/train_%j.log
 
 # ── Project paths ──
 PROJECT_DIR="$HOME/PantanalSpeciesMonitoring"

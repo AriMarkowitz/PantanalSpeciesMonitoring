@@ -6,8 +6,8 @@
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=128G
 #SBATCH --time=6:00:00
-#SBATCH --output=outputs/logs/cluster_%j.log
-#SBATCH --error=outputs/logs/cluster_%j.log
+#SBATCH --output=/users/admarkowitz/PantanalSpeciesMonitoring/outputs/logs/cluster_%j.log
+#SBATCH --error=/users/admarkowitz/PantanalSpeciesMonitoring/outputs/logs/cluster_%j.log
 
 # ── Project paths ──
 PROJECT_DIR="$HOME/PantanalSpeciesMonitoring"

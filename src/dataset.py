@@ -32,10 +32,11 @@ class FeatureDataset(Dataset):
             pseudo_weight: weight for pseudo-labeled samples in the mask
         """
         self.h5 = h5py.File(h5_path, "r")
-        self.features = self.h5["features"]
-        self.labels = self.h5["labels"][:]    # load fully — small
+        self.features = self.h5["features"][:]  # load fully into RAM — avoids per-row HDF5 reads
+        self.labels = self.h5["labels"][:]
         self.masks = self.h5["masks"][:].copy()
         self.folds = self.h5["folds"][:]
+        self.h5.close()  # no longer needed once loaded
 
         # Split by fold
         if split == "val":

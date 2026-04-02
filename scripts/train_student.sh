@@ -7,8 +7,8 @@
 #SBATCH --gres=gpu:1
 #SBATCH --mem=64G
 #SBATCH --time=12:00:00
-#SBATCH --output=outputs/logs/student_%j.log
-#SBATCH --error=outputs/logs/student_%j.log
+#SBATCH --output=/users/admarkowitz/PantanalSpeciesMonitoring/outputs/logs/student_%j.log
+#SBATCH --error=/users/admarkowitz/PantanalSpeciesMonitoring/outputs/logs/student_%j.log
 
 PROJECT_DIR="$HOME/PantanalSpeciesMonitoring"
 ENV_NAME="pantanal"

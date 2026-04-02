@@ -5,8 +5,8 @@
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=32G
 #SBATCH --time=24:00:00
-#SBATCH --output=outputs/logs/distill_scrape_%j.log
-#SBATCH --error=outputs/logs/distill_scrape_%j.log
+#SBATCH --output=/users/admarkowitz/PantanalSpeciesMonitoring/outputs/logs/distill_scrape_%j.log
+#SBATCH --error=/users/admarkowitz/PantanalSpeciesMonitoring/outputs/logs/distill_scrape_%j.log
 
 # ── Project paths ──
 PROJECT_DIR="$HOME/PantanalSpeciesMonitoring"

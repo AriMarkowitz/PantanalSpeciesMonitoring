@@ -222,7 +222,9 @@ def main(cfg: dict):
                     # fall back to segment midpoint (primary soundscape data).
                     raw_event = row.get("event_start_sec") if hasattr(row, "get") else None
                     try:
-                        event_sec = float(raw_event) if raw_event not in (None, "", float("nan")) else None
+                        v = float(raw_event) if raw_event not in (None, "") else None
+                        import math
+                        event_sec = v if (v is not None and not math.isnan(v)) else None
                     except (TypeError, ValueError):
                         event_sec = None
                     center = event_sec if event_sec is not None else (row["start_sec"] + row["end_sec"]) / 2.0

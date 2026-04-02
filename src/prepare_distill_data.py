@@ -14,9 +14,12 @@ Usage:
 """
 
 import os
+import sys
 import pandas as pd
 from pathlib import Path
 from tqdm import tqdm
+
+_IN_TTY = sys.stdout.isatty()
 
 from config import get_config
 from utils import get_audio_duration, setup_logging
@@ -94,7 +97,7 @@ def process_distill_manifest(
     seen_basenames: set[str] = set(existing_basenames)
 
     for _, mrow in tqdm(manifest.iterrows(), total=len(manifest),
-                        desc="prepare_distill"):
+                        desc="prepare_distill", disable=not _IN_TTY):
         # Resolve absolute audio path
         rel_path = str(mrow.get("relative_path", ""))
         audio_path = os.path.join(audio_base_dir, rel_path)

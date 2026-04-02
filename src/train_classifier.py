@@ -18,7 +18,7 @@ from pathlib import Path
 from sklearn.metrics import roc_auc_score
 
 from config import get_config
-from model import MotifClassifier, MaskedFocalLoss
+from model import MotifClassifier, MaskedFocalLoss, MaskedAsymmetricLoss
 from dataset import get_dataloaders
 from utils import setup_logging
 
@@ -135,18 +135,35 @@ def main(cfg: dict):
     logger.info(f"Model params: {n_params:,}")
 
     # Loss, optimizer, scheduler
-    criterion = MaskedFocalLoss(
-        alpha=tcfg["focal_alpha"],
-        gamma=tcfg["focal_gamma"],
-    )
+    loss_name = tcfg.get("loss", "focal")
+    if loss_name == "asl":
+        criterion = MaskedAsymmetricLoss(
+            gamma_pos=tcfg.get("asl_gamma_pos", 0.0),
+            gamma_neg=tcfg.get("asl_gamma_neg", 4.0),
+            clip=tcfg.get("asl_clip", 0.05),
+        )
+        logger.info(f"Loss: ASL (gamma_pos={tcfg.get('asl_gamma_pos', 0.0)}, "
+                     f"gamma_neg={tcfg.get('asl_gamma_neg', 4.0)}, clip={tcfg.get('asl_clip', 0.05)})")
+    else:
+        criterion = MaskedFocalLoss(
+            alpha=tcfg["focal_alpha"],
+            gamma=tcfg["focal_gamma"],
+        )
+        logger.info(f"Loss: Focal (alpha={tcfg['focal_alpha']}, gamma={tcfg['focal_gamma']})")
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=tcfg["lr"],
         weight_decay=tcfg["weight_decay"],
     )
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=tcfg["max_epochs"],
-    )
+    scheduler_name = tcfg.get("scheduler", "cosine")
+    if scheduler_name == "cosine_restarts":
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            optimizer, T_0=tcfg.get("restart_period", 10), T_mult=1,
+        )
+    else:
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=tcfg["max_epochs"],
+        )
 
     # Wandb
     use_wandb = tcfg.get("wandb_project") is not None
