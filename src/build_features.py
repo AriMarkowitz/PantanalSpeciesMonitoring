@@ -22,6 +22,7 @@ from tqdm import tqdm
 _IN_TTY = sys.stdout.isatty()
 
 from config import get_config
+from cluster import load_supcon_projection
 from utils import setup_logging, build_label_map, parse_soundscape_labels
 
 
@@ -329,6 +330,24 @@ def main(cfg: dict):
     K_global = prototypes.shape[0]
     logger.info(f"Global prototypes: {K_global}")
 
+    # Check if prototypes were built with SupCon projection
+    proto_data = np.load(
+        Path(cfg["outputs"]["prototypes_dir"]) / "global_prototypes.npz",
+        allow_pickle=True,
+    )
+    used_supcon = bool(proto_data.get("used_supcon", False))
+    project_fn = None
+    if used_supcon:
+        project_fn = load_supcon_projection(
+            cfg["outputs"]["prototypes_dir"], logger
+        )
+        if project_fn is None:
+            logger.error("Prototypes were built with SupCon but projection "
+                         "matrix not found!")
+            return
+        logger.info("SupCon projection will be applied to embeddings "
+                    "for motif feature computation")
+
     species_gmms = load_species_gmms(cfg["outputs"]["prototypes_dir"])
     logger.info(f"Species GMMs: {len(species_gmms)}")
 
@@ -431,8 +450,19 @@ def main(cfg: dict):
 
     for start in tqdm(range(0, M, CHUNK), desc="Motif chunks", disable=not _IN_TTY):
         end = min(start + CHUNK, M)
+        sp_chunk = sp[start:end]
+
+        # If SupCon projection was used for clustering, project spatial
+        # embeddings into the same space as the prototypes
+        if project_fn is not None:
+            orig_shape = sp_chunk.shape  # (chunk, L, 1536)
+            sp_chunk = project_fn(sp_chunk)
+            # Reshape back: project_fn flattens last dim, need (chunk, L, proj_dim)
+            proj_dim = prototypes.shape[1]
+            sp_chunk = sp_chunk.reshape(orig_shape[0], orig_shape[1], proj_dim)
+
         h, ma, s, n = compute_global_motif_features_batched(
-            sp[start:end], prototypes, temperature=temperature, metric=metric,
+            sp_chunk, prototypes, temperature=temperature, metric=metric,
         )
         hist_all[start:end]    = h
         max_act_all[start:end] = ma
@@ -486,7 +516,8 @@ def main(cfg: dict):
                                 out_dir=Path(cfg["outputs"]["prototypes_dir"]),
                                 logger=logger,
                                 metric=cfg["stage3"].get("similarity_metric", "cosine"),
-                                temperature=cfg["stage3"].get("temperature", 0.1))
+                                temperature=cfg["stage3"].get("temperature", 0.1),
+                                project_fn=project_fn)
 
     logger.info("Stage 3 complete")
 
@@ -499,7 +530,8 @@ def build_cluster_species_table(segments: pd.DataFrame,
                                 out_dir: Path,
                                 logger,
                                 metric: str = "cosine",
-                                temperature: float = 0.1):
+                                temperature: float = 0.1,
+                                project_fn=None):
     """Build P(species | cluster) table for diagnostics.
 
     For each global motif cluster, counts how often each species appears
@@ -535,6 +567,10 @@ def build_cluster_species_table(segments: pd.DataFrame,
             local = spatial.reshape(-1, spatial.shape[-1])  # (15, 1536)
         else:
             local = h5f["global_embeddings"][i].reshape(1, -1)
+
+        # Project into SupCon space if prototypes are in projected space
+        if project_fn is not None:
+            local = project_fn(local)
 
         # Compute soft assignment (same metric as feature extraction)
         if metric == "cosine":

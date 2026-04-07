@@ -40,11 +40,18 @@ EMBED_JOB=$(sbatch --parsable scripts/extract_embeddings.sh)
 echo "Submitted embedding job: $EMBED_JOB"
 
 # ══════════════════════════════════════════════
-# Stage 2+3: Clustering + Feature Extraction
-#   (CPU, high-mem, depends on Stage 1)
+# Stage 1.5: SupCon Projection (GPU, depends on Stage 1)
 # ══════════════════════════════════════════════
-echo "=== Stage 2+3: Clustering + Features (depends on $EMBED_JOB) ==="
-CLUSTER_JOB=$(sbatch --parsable --dependency=afterok:$EMBED_JOB scripts/cluster.sh)
+echo "=== Stage 1.5: SupCon Projection (depends on $EMBED_JOB) ==="
+SUPCON_JOB=$(sbatch --parsable --dependency=afterok:$EMBED_JOB scripts/supcon_project.sh)
+echo "Submitted SupCon job: $SUPCON_JOB"
+
+# ══════════════════════════════════════════════
+# Stage 2+3: Clustering + Feature Extraction
+#   (CPU, high-mem, depends on Stage 1.5)
+# ══════════════════════════════════════════════
+echo "=== Stage 2+3: Clustering + Features (depends on $SUPCON_JOB) ==="
+CLUSTER_JOB=$(sbatch --parsable --dependency=afterok:$SUPCON_JOB scripts/cluster.sh)
 echo "Submitted clustering job: $CLUSTER_JOB"
 
 # ══════════════════════════════════════════════

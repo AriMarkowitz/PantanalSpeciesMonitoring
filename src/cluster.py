@@ -6,9 +6,16 @@ all spatial embeddings (label-free).
 Level 2 — Within-species GMM: discover distinct call types per species
 using BIC-selected Gaussian Mixture Models.
 
+Optionally applies a supervised contrastive projection (Stage 1.5)
+before clustering, mapping embeddings into a space where same-species
+vectors are closer together.
+
 Usage:
     python src/cluster.py
     python src/cluster.py --set stage2.global.subsample_n=100000
+
+    # Use contrastive projection (requires prior supcon_project.py run):
+    python src/cluster.py --supcon
 
     # Include distill embeddings in both clustering levels:
     python src/cluster.py --with-distill
@@ -27,6 +34,37 @@ _IN_TTY = sys.stdout.isatty()
 
 from config import get_config
 from utils import setup_logging, build_label_map, parse_soundscape_labels
+
+
+# ─────────────────────────────────────────────
+# Supervised contrastive projection (optional)
+# ─────────────────────────────────────────────
+
+def load_supcon_projection(proto_dir: str, logger):
+    """Load the SupCon projection matrix W from Stage 1.5.
+
+    Returns a function that projects (N, 1536) -> (N, proj_dim)
+    with L2 normalization, or None if no projection is available.
+    """
+    W_path = Path(proto_dir) / "supcon_W.npy"
+    if not W_path.exists():
+        logger.warning(f"No SupCon projection found at {W_path}")
+        return None
+
+    W = np.load(W_path)  # (proj_dim, 1536)
+    proj_dim = W.shape[0]
+    logger.info(f"Loaded SupCon projection: 1536 -> {proj_dim}")
+
+    def project(X: np.ndarray) -> np.ndarray:
+        """Project and L2-normalize. X: (..., 1536) -> (..., proj_dim)."""
+        orig_shape = X.shape[:-1]
+        flat = X.reshape(-1, 1536)
+        z = flat @ W.T  # (N, proj_dim)
+        norms = np.linalg.norm(z, axis=1, keepdims=True)
+        z = z / np.maximum(norms, 1e-8)
+        return z.reshape(*orig_shape, proj_dim)
+
+    return project
 
 
 # ─────────────────────────────────────────────
@@ -88,8 +126,13 @@ def _load_spatial_sample(h5f, written, subsample_n, rng, logger):
 # Level 1: Global Motif Discovery
 # ─────────────────────────────────────────────
 
-def cluster_global(cfg: dict, logger, distill_h5: str | None = None):
-    """Discover global motif prototypes via HDBSCAN on spatial embeddings."""
+def cluster_global(cfg: dict, logger, distill_h5: str | None = None,
+                   project_fn=None):
+    """Discover global motif prototypes via HDBSCAN on spatial embeddings.
+
+    Args:
+        project_fn: optional callable (N, 1536) -> (N, proj_dim) from SupCon
+    """
     import umap
     import hdbscan
 
@@ -135,6 +178,13 @@ def cluster_global(cfg: dict, logger, distill_h5: str | None = None):
 
     logger.info(f"Subsample shape: {all_local.shape}")
 
+    # Apply SupCon projection if available
+    all_local_raw = all_local  # keep raw embeddings for medoid computation
+    if project_fn is not None:
+        logger.info("Applying SupCon projection before UMAP/HDBSCAN")
+        all_local = project_fn(all_local)
+        logger.info(f"Projected shape: {all_local.shape}")
+
     # UMAP dimensionality reduction
     umap_dim = gcfg["umap_dim"]
     emb_dim = all_local.shape[1]
@@ -162,27 +212,33 @@ def cluster_global(cfg: dict, logger, distill_h5: str | None = None):
     logger.info(f"Found {n_clusters} clusters, {n_noise} noise points "
                 f"({100*n_noise/len(labels):.1f}%)")
 
-    # Compute medoids in original 1536-D space (not UMAP space)
-    logger.info("Computing cluster medoids in original embedding space")
+    # Compute medoids in the clustering space (projected if SupCon, else raw)
+    logger.info("Computing cluster medoids")
     prototypes = []
+    prototypes_raw = []
     prototype_labels = []
     for k in range(n_clusters):
         mask = labels == k
         cluster_points = all_local[mask]
-        # Medoid: point closest to centroid
+        # Medoid: point closest to centroid in clustering space
         centroid = cluster_points.mean(axis=0)
         dists = np.linalg.norm(cluster_points - centroid, axis=1)
-        medoid = cluster_points[dists.argmin()]
-        prototypes.append(medoid)
+        best_idx = dists.argmin()
+        prototypes.append(cluster_points[best_idx])
+        prototypes_raw.append(all_local_raw[mask][best_idx])
         prototype_labels.append(k)
 
-    prototypes = np.array(prototypes)  # (K, 1536)
-    logger.info(f"Prototype matrix: {prototypes.shape}")
+    prototypes = np.array(prototypes)  # (K, emb_dim or proj_dim)
+    prototypes_raw = np.array(prototypes_raw)  # (K, 1536)
+    logger.info(f"Prototype matrix: {prototypes.shape} "
+                f"(raw: {prototypes_raw.shape})")
 
-    # Save artifacts
+    # Save artifacts — prototypes in clustering space + raw 1536-D
     np.savez(out_dir / "global_prototypes.npz",
              prototypes=prototypes,
-             labels=np.array(prototype_labels))
+             prototypes_raw=prototypes_raw,
+             labels=np.array(prototype_labels),
+             used_supcon=project_fn is not None)
 
     with open(out_dir / "global_hdbscan.pkl", "wb") as f:
         pickle.dump(clusterer, f)
@@ -207,11 +263,15 @@ def cluster_global(cfg: dict, logger, distill_h5: str | None = None):
 # Level 2: Within-Species Sub-Clustering
 # ─────────────────────────────────────────────
 
-def cluster_within_species(cfg: dict, logger, distill_h5: str | None = None):
+def cluster_within_species(cfg: dict, logger, distill_h5: str | None = None,
+                           project_fn=None):
     """Fit per-species GMMs with BIC-based model selection.
 
     If distill_h5 is provided, labeled distill segments are merged with
     primary segments to enrich the per-species embedding pools.
+
+    Args:
+        project_fn: optional callable (N, 1536) -> (N, proj_dim) from SupCon
     """
     from sklearn.mixture import GaussianMixture
     from sklearn.decomposition import PCA
@@ -309,6 +369,10 @@ def cluster_within_species(cfg: dict, logger, distill_h5: str | None = None):
         emb = np.vstack(emb_parts) if len(emb_parts) > 1 else emb_parts[0]
         valid = valid_p + valid_d
 
+        # Apply SupCon projection if available
+        if project_fn is not None:
+            emb = project_fn(emb)
+
         if len(valid) < 2:
             species_models[sp] = {"n_components": 0, "n_samples": len(valid)}
             continue
@@ -394,6 +458,9 @@ def parse_args():
     p.add_argument("--distill-h5", type=str, default=None,
                    help="Path to distill_embeddings.h5 "
                         "(default: outputs/embeddings/distill_embeddings.h5)")
+    p.add_argument("--supcon", action="store_true",
+                   help="Apply SupCon projection before clustering "
+                        "(requires prior supcon_project.py run)")
     p.add_argument("--force", action="store_true",
                    help="Rerun Stage 2 even if prototypes/GMMs already exist")
     known, _ = p.parse_known_args()
@@ -412,6 +479,18 @@ def main(cfg: dict):
         )
         logger.info(f"Distill embeddings: {distill_h5}")
 
+    # Load SupCon projection if requested
+    project_fn = None
+    if args.supcon:
+        project_fn = load_supcon_projection(
+            cfg["outputs"]["prototypes_dir"], logger
+        )
+        if project_fn is None:
+            logger.error("--supcon specified but no projection found. "
+                         "Run supcon_project.py first.")
+            sys.exit(1)
+        logger.info("SupCon projection enabled for clustering")
+
     proto_path = Path(cfg["outputs"]["prototypes_dir"]) / "global_prototypes.npz"
     gmm_path   = Path(cfg["outputs"]["prototypes_dir"]) / "species_gmms.pkl"
 
@@ -420,12 +499,12 @@ def main(cfg: dict):
         prototypes = np.load(proto_path)["prototypes"]
     else:
         logger.info("=== Level 1: Global Motif Discovery (HDBSCAN) ===")
-        prototypes, clusterer, reducer = cluster_global(cfg, logger,
-                                                        distill_h5=distill_h5)
+        prototypes, clusterer, reducer = cluster_global(
+            cfg, logger, distill_h5=distill_h5, project_fn=project_fn)
 
         logger.info("=== Level 2: Within-Species Sub-Clustering (GMM) ===")
-        species_models = cluster_within_species(cfg, logger,
-                                                distill_h5=distill_h5)
+        species_models = cluster_within_species(
+            cfg, logger, distill_h5=distill_h5, project_fn=project_fn)
 
     logger.info("Stage 2 complete")
 

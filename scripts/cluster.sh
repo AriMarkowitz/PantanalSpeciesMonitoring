@@ -44,9 +44,18 @@ else
     echo "No distill embeddings found at $DISTILL_H5 — running primary only."
 fi
 
+# ── Auto-detect SupCon projection ──
+SUPCON_ARGS=""
+if [[ -f "$PROJECT_DIR/outputs/prototypes/supcon_W.npy" ]]; then
+    echo "SupCon projection found — clustering in projected space."
+    SUPCON_ARGS="--supcon"
+else
+    echo "No SupCon projection — clustering in raw Perch space."
+fi
+
 # ── Stage 2: Clustering ──
 echo "=== Stage 2: Motif Discovery ==="
-python src/cluster.py $DISTILL_ARGS
+python src/cluster.py --force $DISTILL_ARGS $SUPCON_ARGS
 
 # ── Stage 3: Feature Extraction (runs on same node, fast) ──
 echo "=== Stage 3: Feature Extraction ==="
