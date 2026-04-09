@@ -1052,6 +1052,57 @@ This section tracks what is actually built, running, and missing. The pipeline h
 
 `features.h5` was built using Perch (teacher) embeddings. The student will produce its own embeddings at inference. Because the student distillation loss is cosine similarity to Perch outputs, the student's embedding space aligns with Perch's — prototype assignment (just a matrix multiply against the same `global_prototypes.npz`) will work correctly with student embeddings. However, after student training, it is worth re-running `build_features.py` with student embeddings as a sanity check before finalizing MLP classifier weights.
 
+---
+
+## Future Improvements — Informed by Bird-MAE (arXiv:2504.12880)
+
+**Paper**: "Can Masked Autoencoders Also Listen to Birds?" (Apr 2025). Introduces Bird-MAE, a ViT MAE pretrained on XCL (528k recordings, 9.7k species) with prototypical probing for frozen-representation classification. Achieves SOTA on BirdSet multi-label benchmarks, outperforming Perch by ~15pp mAP average across 8 tasks.
+
+### Key findings relevant to our pipeline
+
+1. **Learned prototypical probing crushes linear probing on frozen embeddings** — 49.97 mAP vs 13.29 mAP on HSN (37pp gap). Our pipeline uses unsupervised prototypes (HDBSCAN) + handcrafted features (histograms, spreads, entropies) + MLP. Their approach of learning J=20 class-specific prototypes with cosine max-pooling over spatial patches is simpler and stronger.
+
+2. **Bird-MAE-L outperforms Perch on every benchmark** — range: +7pp to +16.4pp mAP across 8 BirdSet tasks. Our backbone is Perch v2. Switching to Bird-MAE would likely give a large lift, though at the cost of a heavier model (ViT-L = 304M params vs Perch's EfficientNet-B3 = 12M).
+
+3. **Few-shot prototypical probing is remarkably strong** — 10-shot prototypical probing closely approaches full-data performance. This is directly relevant to our data-starved species problem.
+
+### Concrete improvements to try (ordered by expected impact)
+
+#### A. Replace HDBSCAN motifs + handcrafted features with learned prototypical probing
+**What:** Instead of unsupervised HDBSCAN → motif histograms → MLP, learn J prototypes per class directly from labeled Perch embeddings. Classification becomes: cosine similarity between spatial embeddings and class prototypes → max-pool across spatial positions → constrained linear layer → sigmoid.
+
+**Why:** Eliminates the weakest part of our pipeline — the handcrafted feature engineering between prototypes and classifier. Bird-MAE shows this is worth ~37pp mAP vs linear probing. Our HDBSCAN motifs are closer to this than linear probing, but still add unnecessary indirection.
+
+**Key details from paper:**
+- J=20 prototypes per class (total params: J×C×D + J×C + C ≈ 430k for 234 classes)
+- Non-negative weight constraints on the linear layer (ensures prototypes contribute positively)
+- Orthogonality loss during training (prevents prototype collapse)
+- Cosine similarity, max-pooled over spatial dimensions
+- Works on frozen embeddings — no backbone fine-tuning needed
+
+**Compatibility:** Drops directly into our pipeline after Stage 1. Replaces Stages 2+3+4 with a single trainable module. Student distillation (Stage 1d) and pseudo-labeling (Stage 4b) remain unchanged.
+
+#### B. Use Bird-MAE-Base as backbone instead of / alongside Perch
+**What:** Replace Perch v2 embeddings with Bird-MAE-Base embeddings (ViT-B/16, 85M params, 768-D). Already available on HuggingFace: `DBD-research-group/Bird-MAE-Base`.
+
+**Why:** 15pp average mAP improvement over Perch across all BirdSet tasks. Bird-MAE was pretrained on the same XCL data but with masked autoencoding rather than supervised classification, yielding richer representations.
+
+**Tradeoffs:**
+- Heavier than Perch — distillation even more critical for inference
+- ViT architecture → different spatial embedding structure (8×64 patches vs Perch's 5×3)
+- **Previously tested on BirdCallClassifier**: got reasonable results, but only Bird-MAE-Base (smallest variant) fits the Kaggle CPU inference budget. Larger variants (ViT-L, ViT-H) are too expensive without distillation. Same constraint as Perch — would need the same student distillation pipeline.
+- If using Bird-MAE as teacher, the student distillation target changes from 1536-D (Perch) to 768-D (Bird-MAE-Base), which actually makes the student smaller and faster
+
+#### C. Combine SupCon projection with prototypical probing
+**What:** Use our existing SupCon projection (Stage 1.5) to pre-shape the embedding space, then learn prototypical probes on top. The contrastive projection pulls same-species embeddings together, making prototype learning easier.
+
+**Why:** SupCon and prototypical probing address complementary aspects — SupCon optimizes the embedding geometry globally, prototypical probing optimizes class-specific decision boundaries locally.
+
+#### D. Few-shot prototypical probing for data-starved species
+**What:** For the ~14 species with ≤5 training samples, prototypical probing naturally handles low-resource classes (paper shows 10-shot approaching full-data performance). No special-case handling needed.
+
+**Why:** Our current pipeline requires enough samples for GMM fitting (min_samples_per_component=20) — species below this threshold get no sub-cluster features. Prototypical probing has no such minimum.
+
 ### Immediate Next Steps (ordered)
 
 1. **Wait for `features.h5`** — check log for "Stage 3 complete"; then submit `train_classifier.sh` for each fold

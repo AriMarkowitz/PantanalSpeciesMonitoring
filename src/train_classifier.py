@@ -86,13 +86,22 @@ def evaluate(model, loader, criterion, device):
     labels = np.concatenate(all_labels)
     masks = np.concatenate(all_masks)
 
-    # Only evaluate AUC on supervised species (where mask > 0 for at least some samples)
-    supervised_cols = masks.sum(axis=0) > 0
-    if supervised_cols.any():
-        auc = compute_macro_auc(labels[:, supervised_cols],
-                                preds[:, supervised_cols])
-    else:
-        auc = 0.0
+    # Per-species masked AUC: only evaluate each species on rows where
+    # that species is supervised (mask > 0), avoiding noise from
+    # unsupervised rows whose labels default to zero.
+    aucs = []
+    for i in range(preds.shape[1]):
+        sp_mask = masks[:, i] > 0
+        if sp_mask.sum() < 2:
+            continue
+        y_t = labels[sp_mask, i]
+        y_p = preds[sp_mask, i]
+        if y_t.sum() > 0 and y_t.sum() < len(y_t):
+            try:
+                aucs.append(roc_auc_score(y_t, y_p))
+            except ValueError:
+                continue
+    auc = np.mean(aucs) if aucs else 0.0
 
     return total_loss / max(n_batches, 1), auc
 

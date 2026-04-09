@@ -260,7 +260,9 @@ def build_labels_and_masks(segments: pd.DataFrame, label_map: dict):
         quality = row["label_quality"]
 
         if quality == "unlabeled":
-            # No loss signal — mask everything
+            # No loss signal — mask everything.
+            # These are soundscape segments without annotations; we can't
+            # assume species absence (no label ≠ species not present).
             continue
 
         elif quality == "strong_multilabel":
@@ -387,9 +389,17 @@ def main(cfg: dict):
     logger.info(f"Loading {len(valid_indices)} valid global embeddings for batched GMM scoring")
     global_embs_valid = h5_emb["global_embeddings"][sorted(valid_indices)]  # (M, 1536)
 
+    # GMMs were fitted on SupCon-projected embeddings (256D), so we must
+    # project here too — otherwise PCA.transform fails on 1536D input.
+    if project_fn is not None:
+        gmm_embs = project_fn(global_embs_valid)  # (M, proj_dim)
+        logger.info(f"Projected embeddings for GMM scoring: {global_embs_valid.shape} → {gmm_embs.shape}")
+    else:
+        gmm_embs = global_embs_valid
+
     logger.info("Running batched species GMM scoring (vectorized)")
     gmm_best_match_valid, gmm_sub_ent_valid = compute_all_subcluster_features_batched(
-        global_embs_valid, species_gmms, label_map, logger=logger
+        gmm_embs, species_gmms, label_map, logger=logger
     )  # (M, num_species) each
 
     # Build scatter-back lookup: original index → position in valid array

@@ -64,7 +64,7 @@ stage3:
   temperature: 0.1             # softmax temperature — lower = sharper assignment
 
 stage4:
-  hidden_dims: [2048, 1024, 512, 256]
+  hidden_dims: [512, 256]
   dropout: 0.3
   lr: 1.0e-3
   weight_decay: 1.0e-4
@@ -81,9 +81,9 @@ stage1d:
   embed_dim: 1536
   epochs: 25
   batch_size: 64
-  num_workers: 4
-  backbone_lr: 1.0e-5      # lower lr for pretrained backbone
-  head_lr: 1.0e-4          # higher lr for projection heads
+  num_workers: 8
+  backbone_lr: 5.0e-5      # lower lr for pretrained backbone
+  head_lr: 1.0e-3          # higher lr for randomly initialized projection heads
   weight_decay: 1.0e-4
   lambda_global: 1.0
   lambda_spatial: 1.0

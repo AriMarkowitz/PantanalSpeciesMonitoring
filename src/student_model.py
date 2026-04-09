@@ -2,7 +2,7 @@
 
 EfficientNet-B1-BirdSet-XCL backbone with two projection heads:
   - global_head:  global avg pool → Linear(1536)   matches Perch global embedding
-  - spatial_head: adaptive pool (5,3) → Linear(1536) per cell  matches Perch spatial
+  - spatial_head: adaptive pool (5,1) → Linear(1536) per frame  matches Perch spatial
 
 Both heads produce L2-normalized embeddings so cosine similarity to frozen
 Perch prototypes works identically at inference.
@@ -10,7 +10,7 @@ Perch prototypes works identically at inference.
 Usage (import):
     from student_model import StudentEmbedder
     model = StudentEmbedder.from_pretrained()
-    global_emb, spatial_emb = model(mel_spec)  # (B,1536), (B,5,3,1536)
+    global_emb, spatial_emb = model(mel_spec)  # (B,1536), (B,5,1536)
 """
 
 from __future__ import annotations
@@ -24,7 +24,7 @@ from transformers import EfficientNetModel, EfficientNetConfig
 BIRDSET_BACKBONE = "DBD-research-group/EfficientNet-B1-BirdSet-XCL"
 PERCH_EMBED_DIM = 1536
 SPATIAL_H = 5
-SPATIAL_W = 3
+SPATIAL_W = 1
 
 
 class StudentEmbedder(nn.Module):
@@ -72,11 +72,10 @@ class StudentEmbedder(nn.Module):
 
         Returns:
             global_emb: (B, embed_dim)
-            spatial_emb: (B, spatial_h, spatial_w, embed_dim)
+            spatial_emb: (B, spatial_h, embed_dim)
         """
-        # EfficientNet expects 3-channel input — tile single mel channel
-        if mel.shape[1] == 1:
-            mel = mel.expand(-1, 3, -1, -1)
+        # BirdSet EfficientNet-B1 is configured with num_channels=1
+        # (pretrained on single-channel mel spectrograms)
 
         # Backbone: returns last_hidden_state (B, C, H', W')
         feat = self.backbone(mel).last_hidden_state  # (B, 1280, H', W')
@@ -84,13 +83,13 @@ class StudentEmbedder(nn.Module):
         # Global embedding
         global_emb = self.global_head(feat)  # (B, 1536)
 
-        # Spatial embedding: pool to (5,3), then project each cell
-        spatial_pooled = self.spatial_pool(feat)  # (B, 1280, 5, 3)
+        # Spatial embedding: pool to (5,1), then project each cell
+        spatial_pooled = self.spatial_pool(feat)  # (B, 1280, 5, 1)
         B, C, H, W = spatial_pooled.shape
-        # Reshape to (B*H*W, C), project, reshape back
-        cells = spatial_pooled.permute(0, 2, 3, 1).reshape(-1, C)  # (B*H*W, C)
-        cells_proj = self.spatial_proj(cells)                        # (B*H*W, 1536)
-        spatial_emb = cells_proj.reshape(B, H, W, -1)               # (B, 5, 3, 1536)
+        # Reshape to (B*H, C), project, reshape to (B, 5, 1536)
+        cells = spatial_pooled.squeeze(-1).permute(0, 2, 1).reshape(-1, C)  # (B*H, C)
+        cells_proj = self.spatial_proj(cells)                                 # (B*H, 1536)
+        spatial_emb = cells_proj.reshape(B, H, -1)                           # (B, 5, 1536)
 
         return global_emb, spatial_emb
 
@@ -100,7 +99,7 @@ class StudentEmbedder(nn.Module):
 
         Returns:
             global_emb: (B, embed_dim)   — L2 normalized if normalize=True
-            spatial_emb: (B, H, W, embed_dim) — L2 normalized per cell
+            spatial_emb: (B, H, embed_dim) — L2 normalized per frame
         """
         global_emb, spatial_emb = self.encode(mel)
 
@@ -135,8 +134,8 @@ class DistillationLoss(nn.Module):
     def forward(self,
                 student_global: torch.Tensor,   # (B, D)
                 teacher_global: torch.Tensor,   # (B, D)
-                student_spatial: torch.Tensor,  # (B, H, W, D)
-                teacher_spatial: torch.Tensor,  # (B, H, W, D)
+                student_spatial: torch.Tensor,  # (B, H, D)
+                teacher_spatial: torch.Tensor,  # (B, H, D)
                 student_logits: torch.Tensor | None = None,   # (B, top_k)
                 teacher_logits: torch.Tensor | None = None,   # (B, top_k)
                 ) -> tuple[torch.Tensor, dict]:
@@ -145,10 +144,9 @@ class DistillationLoss(nn.Module):
         loss_global = (1.0 - F.cosine_similarity(student_global,
                                                    teacher_global, dim=-1)).mean()
 
-        # Spatial cosine loss — flatten H*W cells, mean over all
-        B, H, W, D = student_spatial.shape
-        s_flat = student_spatial.reshape(-1, D)
-        t_flat = teacher_spatial.reshape(-1, D)
+        # Spatial cosine loss — flatten all frames, mean over all
+        s_flat = student_spatial.reshape(-1, student_spatial.shape[-1])
+        t_flat = teacher_spatial.reshape(-1, teacher_spatial.shape[-1])
         loss_spatial = (1.0 - F.cosine_similarity(s_flat, t_flat, dim=-1)).mean()
 
         total = (self.lambda_global * loss_global

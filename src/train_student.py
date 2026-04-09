@@ -48,24 +48,33 @@ class DistillDataset(Dataset):
                  fold: int = 0, split: str = "train", n_folds: int = 5):
         import pandas as pd
         self.segs = pd.read_csv(segments_csv, low_memory=False).reset_index(drop=True)
-        self.h5 = h5py.File(embeddings_h5, "r")
-        self.written = self.h5["written"][:]
-        self.has_spatial = "spatial_embeddings" in self.h5
-        self.has_logits = "logit_values" in self.h5
+
         self.cfg = cfg
         self.sr = cfg["data"]["sample_rate"]
         self.seg_dur = cfg["data"]["segment_duration"]
         self.top_k = cfg["stage1"]["top_k_logits"]
         self.mel_cfg = cfg.get("student_mel", {})
 
+        # Load all teacher embeddings into RAM (~13GB total, shared across
+        # forked workers via copy-on-write). This avoids HDF5 fork deadlocks
+        # and is faster than random HDF5 reads during training.
+        with h5py.File(embeddings_h5, "r") as h5:
+            written = h5["written"][:]
+            self.global_embs = h5["global_embeddings"][:]       # (N, 1536) float32
+            self.has_spatial = "spatial_embeddings" in h5
+            self.has_logits = "logit_values" in h5
+            if self.has_spatial:
+                self.spatial_embs = h5["spatial_embeddings"][:]  # (N, 5, 1536) float32
+            if self.has_logits:
+                self.logit_vals = h5["logit_values"][:].astype(np.float32)
+            folds_arr = (h5["folds"][:] if "folds" in h5
+                         else np.arange(len(self.segs)) % n_folds)
+
         # Only use segments with valid embeddings
-        valid = np.where(self.written)[0]
+        valid = np.where(written)[0]
 
         # Fold split
         if fold >= 0 and n_folds > 1:
-            folds_arr = self.h5["folds"][:] if "folds" in self.h5 else (
-                np.arange(len(self.segs)) % n_folds
-            )
             if split == "val":
                 self.indices = valid[np.isin(valid, np.where(folds_arr == fold)[0])]
             else:
@@ -78,82 +87,54 @@ class DistillDataset(Dataset):
 
     def __getitem__(self, idx):
         i = self.indices[idx]
-        row = self.segs.iloc[i]
 
-        # Load audio → mel spectrogram
+        # Load audio on-the-fly and compute mel (~30ms total)
+        row = self.segs.iloc[i]
         try:
             wav = load_audio_segment(
                 str(row["source_file"]),
                 float(row["start_sec"]),
                 float(row["end_sec"]),
-                target_sr=self.sr,
+                sr=self.sr,
             )
         except Exception:
             wav = np.zeros(int(self.sr * self.seg_dur), dtype=np.float32)
-
         mel = wav_to_mel(wav, self.sr, self.mel_cfg)  # (1, n_mels, T)
 
-        # Teacher targets
+        # Teacher targets (pre-loaded numpy arrays — fork-safe, no HDF5)
         global_emb = torch.from_numpy(
-            self.h5["global_embeddings"][i].astype(np.float32)
+            self.global_embs[i].astype(np.float32)
         )  # (1536,)
 
         if self.has_spatial:
-            spatial = self.h5["spatial_embeddings"][i].astype(np.float32)
-            spatial_emb = torch.from_numpy(spatial)  # (5, 3, 1536)
+            spatial_emb = torch.from_numpy(
+                self.spatial_embs[i].astype(np.float32)
+            )  # (5, 1536)
         else:
-            # Fallback: repeat global_emb across spatial positions
-            spatial_emb = global_emb.unsqueeze(0).unsqueeze(0).expand(5, 3, -1)
+            spatial_emb = global_emb.unsqueeze(0).expand(5, -1)
 
         if self.has_logits:
-            logit_vals = torch.from_numpy(
-                self.h5["logit_values"][i].astype(np.float32)
-            )  # (top_k,)
+            logit_vals = torch.from_numpy(self.logit_vals[i])  # (top_k,)
         else:
             logit_vals = torch.zeros(self.top_k)
 
         return mel, global_emb, spatial_emb, logit_vals
 
     def close(self):
-        self.h5.close()
+        pass
 
 
 def wav_to_mel(wav: np.ndarray, sr: int, mel_cfg: dict) -> torch.Tensor:
-    """Convert waveform to mel spectrogram matching Perch's frontend.
+    """Convert waveform to log-mel spectrogram.
 
-    Perch uses: 128 mel bins, 32kHz, hop=10ms, window=25ms, PCEN normalization.
-    We use a standard log-mel as a close approximation (PCEN adds complexity
-    for minimal gain in distillation context).
+    Uses the same fast numpy pipeline as cache_mels (~3ms per 5s segment).
 
     Returns:
         mel: (1, n_mels, T) float32 tensor
     """
-    import librosa
-
-    n_mels = mel_cfg.get("n_mels", 128)
-    hop_length = int(sr * mel_cfg.get("hop_ms", 10) / 1000)
-    win_length = int(sr * mel_cfg.get("win_ms", 25) / 1000)
-    fmin = mel_cfg.get("fmin", 60.0)
-    fmax = mel_cfg.get("fmax", 16000.0)
-
-    # Pad/trim to exact duration
-    target_len = int(sr * 5.0)
-    if len(wav) < target_len:
-        wav = np.pad(wav, (0, target_len - len(wav)))
-    else:
-        wav = wav[:target_len]
-
-    mel = librosa.feature.melspectrogram(
-        y=wav, sr=sr, n_mels=n_mels,
-        hop_length=hop_length, win_length=win_length,
-        fmin=fmin, fmax=fmax, power=2.0,
-    )
-    mel = librosa.power_to_db(mel, ref=np.max).astype(np.float32)
-
-    # Normalize to [0, 1]
-    mel = (mel - mel.min()) / (mel.max() - mel.min() + 1e-8)
-
-    return torch.from_numpy(mel).unsqueeze(0)  # (1, n_mels, T)
+    from cache_mels import wav_to_mel_np
+    mel_np = wav_to_mel_np(wav, sr, mel_cfg)  # (n_mels, T)
+    return torch.from_numpy(mel_np).unsqueeze(0).float()  # (1, n_mels, T)
 
 
 # ── Training ──────────────────────────────────────────────────────────────────
@@ -168,11 +149,14 @@ def collate_fn(batch):
     )
 
 
-def train_one_epoch(model, loader, optimizer, criterion, device, scaler):
+def train_one_epoch(model, loader, optimizer, criterion, device, scaler,
+                    logger=None):
     model.train()
     total_loss = 0.0
     breakdown_acc = {}
     n_batches = 0
+    n_total = len(loader)
+    log_every = max(1, n_total // 10)  # log ~10 times per epoch
 
     for mels, t_global, t_spatial, t_logits in loader:
         mels = mels.to(device)
@@ -193,18 +177,25 @@ def train_one_epoch(model, loader, optimizer, criterion, device, scaler):
         if scaler is not None:
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
             scaler.step(optimizer)
             scaler.update()
         else:
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
             optimizer.step()
 
         total_loss += loss.item()
         for k, v in breakdown.items():
             breakdown_acc[k] = breakdown_acc.get(k, 0.0) + v
         n_batches += 1
+
+        if logger and n_batches % log_every == 0:
+            avg_loss = total_loss / n_batches
+            logger.info(f"  batch {n_batches}/{n_total}  "
+                        f"running_loss={avg_loss:.4f}")
+            for h in logger.handlers:
+                h.flush()
 
     avg = {k: v / max(n_batches, 1) for k, v in breakdown_acc.items()}
     avg["loss_total"] = total_loss / max(n_batches, 1)
@@ -268,6 +259,7 @@ def main(cfg: dict):
         cfg["outputs"]["embeddings_h5"],
         cfg, fold=fold, split="val",
     )
+    logger.info("Teacher embeddings loaded into RAM (fork-safe, no HDF5 during training)")
 
     # Optionally add distill corpus (no fold splitting — always in train)
     distill_h5 = cfg["outputs"].get("distill_embeddings_h5", "")
@@ -350,7 +342,8 @@ def main(cfg: dict):
 
     for epoch in range(max_epochs):
         train_metrics = train_one_epoch(model, train_dl, optimizer,
-                                         criterion, device, scaler)
+                                         criterion, device, scaler,
+                                         logger=logger)
         val_loss, val_cos = evaluate(model, val_dl, criterion, device)
         scheduler.step()
 
@@ -360,6 +353,8 @@ def main(cfg: dict):
         logger.info(
             f"Epoch {epoch+1:3d}/{max_epochs}  "
             f"train_loss={train_metrics['loss_total']:.4f}  "
+            f"(global={train_metrics.get('loss_global', 0):.4f}  "
+            f"spatial={train_metrics.get('loss_spatial', 0):.4f})  "
             f"val_loss={val_loss:.4f}  "
             f"val_cos_sim={val_cos:.4f}  "
             f"lr_backbone={lr_backbone:.2e}  lr_head={lr_head:.2e}"
