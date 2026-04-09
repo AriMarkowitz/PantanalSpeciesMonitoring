@@ -80,8 +80,9 @@ stage1d:
   backbone: DBD-research-group/EfficientNet-B1-BirdSet-XCL
   embed_dim: 1536
   epochs: 25
-  batch_size: 64
-  num_workers: 8
+  batch_size: 256
+  num_workers: 4
+  prefetch_factor: 2
   backbone_lr: 5.0e-5      # lower lr for pretrained backbone
   head_lr: 1.0e-3          # higher lr for randomly initialized projection heads
   weight_decay: 1.0e-4

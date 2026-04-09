@@ -32,8 +32,9 @@ from utils import setup_logging, load_audio_segment
 class DistillDataset(Dataset):
     """Dataset for student distillation.
 
-    Loads raw audio on-the-fly, builds mel spectrogram, and returns
-    pre-computed Perch embeddings as targets.
+    Reads pre-cached mel spectrograms from a numpy memmap and teacher
+    embeddings from RAM. Zero audio I/O during training — all data is
+    pre-computed. Fully fork-safe (no HDF5 handles, no file I/O in workers).
 
     Args:
         segments_csv: path to segments.csv (or distill_segments.csv)
@@ -47,7 +48,7 @@ class DistillDataset(Dataset):
     def __init__(self, segments_csv: str, embeddings_h5: str, cfg: dict,
                  fold: int = 0, split: str = "train", n_folds: int = 5):
         import pandas as pd
-        self.segs = pd.read_csv(segments_csv, low_memory=False).reset_index(drop=True)
+        from cache_mels import get_mel_shape
 
         self.cfg = cfg
         self.sr = cfg["data"]["sample_rate"]
@@ -55,9 +56,7 @@ class DistillDataset(Dataset):
         self.top_k = cfg["stage1"]["top_k_logits"]
         self.mel_cfg = cfg.get("student_mel", {})
 
-        # Load all teacher embeddings into RAM (~13GB total, shared across
-        # forked workers via copy-on-write). This avoids HDF5 fork deadlocks
-        # and is faster than random HDF5 reads during training.
+        # Load teacher embeddings into RAM (fork-safe via COW)
         with h5py.File(embeddings_h5, "r") as h5:
             written = h5["written"][:]
             self.global_embs = h5["global_embeddings"][:]       # (N, 1536) float32
@@ -68,7 +67,20 @@ class DistillDataset(Dataset):
             if self.has_logits:
                 self.logit_vals = h5["logit_values"][:].astype(np.float32)
             folds_arr = (h5["folds"][:] if "folds" in h5
-                         else np.arange(len(self.segs)) % n_folds)
+                         else np.arange(len(pd.read_csv(segments_csv, nrows=0).columns)) % n_folds
+                         if False else np.arange(len(written)) % n_folds)
+
+        # Load cached mel memmap (float16, instant random access)
+        memmap_path = embeddings_h5 + ".mels.npy"
+        n_mels, T = get_mel_shape(cfg)
+        N = len(written)
+        if not Path(memmap_path).exists():
+            raise FileNotFoundError(
+                f"Mel cache not found: {memmap_path}\n"
+                f"Run 'python src/cache_mels.py --distill' first."
+            )
+        self.mels = np.memmap(memmap_path, dtype=np.float16, mode="r",
+                              shape=(N, n_mels, T))
 
         # Only use segments with valid embeddings
         valid = np.where(written)[0]
@@ -88,28 +100,14 @@ class DistillDataset(Dataset):
     def __getitem__(self, idx):
         i = self.indices[idx]
 
-        # Load audio on-the-fly and compute mel (~30ms total)
-        row = self.segs.iloc[i]
-        try:
-            wav = load_audio_segment(
-                str(row["source_file"]),
-                float(row["start_sec"]),
-                float(row["end_sec"]),
-                sr=self.sr,
-            )
-        except Exception:
-            wav = np.zeros(int(self.sr * self.seg_dur), dtype=np.float32)
-        mel = wav_to_mel(wav, self.sr, self.mel_cfg)  # (1, n_mels, T)
+        # Cached mel: memmap read (~0.01ms, OS page cache)
+        mel = torch.from_numpy(self.mels[i].astype(np.float32)).unsqueeze(0)  # (1, n_mels, T)
 
-        # Teacher targets (pre-loaded numpy arrays — fork-safe, no HDF5)
-        global_emb = torch.from_numpy(
-            self.global_embs[i].astype(np.float32)
-        )  # (1536,)
+        # Teacher targets (pre-loaded numpy arrays)
+        global_emb = torch.from_numpy(self.global_embs[i])  # (1536,)
 
         if self.has_spatial:
-            spatial_emb = torch.from_numpy(
-                self.spatial_embs[i].astype(np.float32)
-            )  # (5, 1536)
+            spatial_emb = torch.from_numpy(self.spatial_embs[i])  # (5, 1536)
         else:
             spatial_emb = global_emb.unsqueeze(0).expand(5, -1)
 
@@ -259,7 +257,7 @@ def main(cfg: dict):
         cfg["outputs"]["embeddings_h5"],
         cfg, fold=fold, split="val",
     )
-    logger.info("Teacher embeddings loaded into RAM (fork-safe, no HDF5 during training)")
+    logger.info("Embeddings + cached mels loaded (zero I/O during training)")
 
     # Optionally add distill corpus (no fold splitting — always in train)
     distill_h5 = cfg["outputs"].get("distill_embeddings_h5", "")
@@ -277,12 +275,14 @@ def main(cfg: dict):
     logger.info(f"Val:   {len(val_ds)}")
 
     batch_size = scfg.get("batch_size", 64)
+    num_workers = scfg.get("num_workers", 4)
+    prefetch = scfg.get("prefetch_factor", 2)
     train_dl = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
-                          num_workers=scfg.get("num_workers", 4),
+                          num_workers=num_workers, prefetch_factor=prefetch,
                           collate_fn=collate_fn, pin_memory=True,
                           drop_last=True, persistent_workers=True)
     val_dl = DataLoader(val_ds, batch_size=batch_size, shuffle=False,
-                        num_workers=scfg.get("num_workers", 4),
+                        num_workers=num_workers, prefetch_factor=prefetch,
                         collate_fn=collate_fn, pin_memory=True,
                         persistent_workers=True)
 

@@ -1,11 +1,12 @@
 #!/bin/bash
 #SBATCH --job-name=cache_mels
-#SBATCH --partition=general
+#SBATCH --partition=l40s
+#SBATCH --gres=gpu:1
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=16
-#SBATCH --mem=64G
-#SBATCH --time=0:30:00
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=32G
+#SBATCH --time=3:00:00
 #SBATCH --output=/users/admarkowitz/PantanalSpeciesMonitoring/outputs/logs/cache_mels_%j.log
 #SBATCH --error=/users/admarkowitz/PantanalSpeciesMonitoring/outputs/logs/cache_mels_%j.log
 
@@ -32,6 +33,6 @@ echo "---"
 
 cd "$PROJECT_DIR"
 
-python src/cache_mels.py --distill --num-workers 16
+python src/cache_mels.py --distill --num-workers 8
 
 echo "Mel caching complete (job=$SLURM_JOB_ID)."

@@ -1,8 +1,9 @@
-"""Pre-cache mel spectrograms into the embeddings HDF5 file.
+"""Pre-cache mel spectrograms as memory-mapped numpy arrays.
 
-Computes mel spectrograms for all segments once and stores them as a new
-dataset in embeddings.h5 (and optionally distill_embeddings.h5). This
-eliminates the audio I/O bottleneck during student distillation training.
+Computes mel spectrograms for all segments once and stores them as flat
+numpy memmap files (.npy) for instant random access during training.
+float16 is used for [0,1] normalized values (resolution ~0.001, plenty
+for mel input).
 
 Usage:
     python src/cache_mels.py
@@ -19,8 +20,6 @@ from multiprocessing import Pool
 
 from config import get_config
 from utils import setup_logging, load_audio_segment
-
-_IN_TTY = sys.stdout.isatty()
 
 
 def _build_mel_basis(sr: int, mel_cfg: dict):
@@ -99,53 +98,71 @@ def _process_segment(args):
         return idx, None, False
 
 
-def cache_mels_for_h5(segments_csv: str, h5_path: str, cfg: dict, logger,
+def get_mel_shape(cfg: dict) -> tuple:
+    """Return (n_mels, T) for the configured mel parameters."""
+    sr = cfg["data"]["sample_rate"]
+    mel_cfg = cfg.get("student_mel", {})
+    n_mels = mel_cfg.get("n_mels", 128)
+    hop_length = int(sr * mel_cfg.get("hop_ms", 10) / 1000)
+    target_len = int(sr * cfg["data"]["segment_duration"])
+    T = target_len // hop_length + 1
+    return n_mels, T
+
+
+def cache_mels_memmap(segments_csv: str, h5_path: str, cfg: dict, logger,
                       num_workers: int = 16):
-    """Add a 'mel_spectrograms' dataset to an existing embeddings HDF5."""
+    """Cache mel spectrograms as a float16 numpy memmap alongside the HDF5.
+
+    Creates <h5_path>.mels.npy — a flat (N, n_mels, T) float16 memmap.
+    """
     segments = pd.read_csv(segments_csv, low_memory=False)
     sr = cfg["data"]["sample_rate"]
     seg_dur = cfg["data"]["segment_duration"]
     mel_cfg = cfg.get("student_mel", {})
 
-    h5 = h5py.File(h5_path, "a")  # append mode
-    written = h5["written"][:]
+    with h5py.File(h5_path, "r") as h5:
+        written = h5["written"][:]
+
     N = len(segments)
+    n_mels, T = get_mel_shape(cfg)
 
-    if "mel_spectrograms" in h5:
-        logger.info(f"mel_spectrograms already exists in {h5_path} — skipping")
-        h5.close()
-        return
+    memmap_path = h5_path + ".mels.npy"
+    size_gb = N * n_mels * T * 2 / 1e9  # float16
+    logger.info(f"Mel shape: ({n_mels}, {T}), N={N}, storage: {size_gb:.1f} GB (float16)")
+    logger.info(f"Output: {memmap_path}")
 
-    # Figure out mel shape from a test sample
-    n_mels = mel_cfg.get("n_mels", 128)
-    hop_length = int(sr * mel_cfg.get("hop_ms", 10) / 1000)
-    target_len = int(sr * seg_dur)
-    T = target_len // hop_length + 1
-    logger.info(f"Mel shape per segment: ({n_mels}, {T}), dtype=float32")
-    logger.info(f"Total storage: {N * n_mels * T * 4 / 1e9:.1f} GB")
-
-    mel_ds = h5.create_dataset(
-        "mel_spectrograms", shape=(N, n_mels, T), dtype="float32",
-        chunks=(64, n_mels, T), compression="lzf",
-    )
-
-    # Build work items for valid segments only
+    # Resume support: reuse existing memmap, skip already-cached indices
     valid_indices = np.where(written)[0]
+
+    if Path(memmap_path).exists():
+        mmap = np.memmap(memmap_path, dtype=np.float16, mode="r+",
+                         shape=(N, n_mels, T))
+        # Find which valid indices still have all-zero mels (uncached)
+        already_done = 0
+        todo_mask = np.ones(len(valid_indices), dtype=bool)
+        for j, idx in enumerate(valid_indices):
+            if mmap[idx].any():  # non-zero = already cached
+                todo_mask[j] = False
+                already_done += 1
+        valid_indices = valid_indices[todo_mask]
+        logger.info(f"Resuming: {already_done} already cached, "
+                    f"{len(valid_indices)} remaining")
+    else:
+        mmap = np.memmap(memmap_path, dtype=np.float16, mode="w+",
+                         shape=(N, n_mels, T))
+
     logger.info(f"Computing mels for {len(valid_indices)}/{N} valid segments "
                 f"with {num_workers} workers")
 
-    work = []
-    for idx in valid_indices:
-        row = segments.iloc[idx]
-        work.append((
-            idx,
-            str(row["source_file"]),
-            float(row["start_sec"]),
-            float(row["end_sec"]),
-            sr, seg_dur, mel_cfg,
-        ))
+    # Pre-extract columns as numpy for fast worker access
+    source_files = segments["source_file"].values.astype(str)
+    start_secs = segments["start_sec"].values.astype(np.float64)
+    end_secs = segments["end_sec"].values.astype(np.float64)
 
-    # Process in chunks to limit memory and write progressively
+    work = [(idx, source_files[idx], start_secs[idx], end_secs[idx],
+             sr, seg_dur, mel_cfg) for idx in valid_indices]
+
+    # Process in chunks to limit memory
     CHUNK = 5000
     n_done = 0
     n_failed = 0
@@ -158,10 +175,9 @@ def cache_mels_for_h5(segments_csv: str, h5_path: str, cfg: dict, logger,
 
         for idx, mel, ok in results:
             if ok and mel is not None:
-                # Pad/trim to exact T
                 if mel.shape[1] < T:
                     mel = np.pad(mel, ((0, 0), (0, T - mel.shape[1])))
-                mel_ds[idx] = mel[:, :T]
+                mmap[idx] = mel[:, :T].astype(np.float16)
             else:
                 n_failed += 1
 
@@ -171,9 +187,9 @@ def cache_mels_for_h5(segments_csv: str, h5_path: str, cfg: dict, logger,
         for handler in logger.handlers:
             handler.flush()
 
-    h5.flush()
-    h5.close()
-    logger.info(f"Cached {n_done - n_failed} mels to {h5_path}")
+    mmap.flush()
+    del mmap
+    logger.info(f"Cached {n_done - n_failed} mels to {memmap_path}")
 
 
 def main():
@@ -186,10 +202,10 @@ def main():
     cfg = get_config()
     logger = setup_logging("cache_mels", cfg["outputs"]["logs_dir"])
 
-    logger.info("Caching mel spectrograms into embeddings HDF5")
+    logger.info("Caching mel spectrograms as numpy memmap files")
 
     # Primary corpus
-    cache_mels_for_h5(
+    cache_mels_memmap(
         cfg["outputs"]["segments_csv"],
         cfg["outputs"]["embeddings_h5"],
         cfg, logger, num_workers=args.num_workers,
@@ -200,7 +216,7 @@ def main():
         distill_h5 = cfg["outputs"].get("distill_embeddings_h5", "")
         distill_csv = cfg["outputs"].get("distill_segments_csv", "")
         if distill_h5 and Path(distill_h5).exists():
-            cache_mels_for_h5(
+            cache_mels_memmap(
                 distill_csv, distill_h5, cfg, logger,
                 num_workers=args.num_workers,
             )
