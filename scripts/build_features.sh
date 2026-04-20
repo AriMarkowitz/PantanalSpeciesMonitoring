@@ -36,6 +36,6 @@ cd "$PROJECT_DIR"
 
 # ── Stage 3: Feature Extraction ──
 echo "=== Stage 3: Feature Extraction ==="
-python src/build_features.py
+python src/build_features.py ${STUDENT:+--student}
 
 echo "Feature extraction complete (job=$SLURM_JOB_ID)."

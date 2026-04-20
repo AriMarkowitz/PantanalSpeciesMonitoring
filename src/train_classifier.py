@@ -203,6 +203,8 @@ def main(cfg: dict):
 
     best_auc = 0.0
     best_epoch = -1
+    patience = tcfg.get("early_stop_patience", 5)
+    epochs_since_improvement = 0
 
     # Training loop
     for epoch in range(tcfg["max_epochs"]):
@@ -230,6 +232,7 @@ def main(cfg: dict):
         if val_auc > best_auc:
             best_auc = val_auc
             best_epoch = epoch + 1
+            epochs_since_improvement = 0
             ckpt_path = run_dir / f"best_val_auc={val_auc:.4f}_epoch={epoch+1}.pt"
             torch.save({
                 "epoch": epoch + 1,
@@ -243,6 +246,14 @@ def main(cfg: dict):
                 "config": tcfg,
             }, ckpt_path)
             logger.info(f"  → New best: val_auc={val_auc:.4f} saved to {ckpt_path}")
+        else:
+            epochs_since_improvement += 1
+            if epochs_since_improvement >= patience:
+                logger.info(
+                    f"Early stopping at epoch {epoch+1}: no val_auc improvement "
+                    f"for {patience} epochs (best={best_auc:.4f} @ epoch {best_epoch})"
+                )
+                break
 
     logger.info(f"Training complete. Best val_auc={best_auc:.4f} at epoch {best_epoch}")
 

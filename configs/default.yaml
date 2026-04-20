@@ -64,32 +64,39 @@ stage3:
   temperature: 0.1             # softmax temperature — lower = sharper assignment
 
 stage4:
-  hidden_dims: [512, 256]
-  dropout: 0.3
+  # Regularization tuned for the no-Perch-logits feature set (3538D).
+  # Without logits, the model overfits fast — best epoch was 2/50 on the
+  # previous run. Shrink capacity, raise dropout + weight decay, add early stop.
+  hidden_dims: [256, 128]
+  dropout: 0.5
   lr: 1.0e-3
-  weight_decay: 1.0e-4
-  max_epochs: 50
+  weight_decay: 1.0e-3
+  max_epochs: 20
+  early_stop_patience: 5
   batch_size: 512
   n_folds: 5
-  loss: focal
+  loss: asl
   focal_alpha: 0.25
   focal_gamma: 2.0
+  asl_gamma_pos: 0.0
+  asl_gamma_neg: 4.0
+  asl_clip: 0.05
   wandb_project: pantanal-monitoring
 
 stage1d:
   backbone: DBD-research-group/EfficientNet-B1-BirdSet-XCL
   embed_dim: 1536
-  epochs: 25
+  epochs: 60
   batch_size: 256
   num_workers: 4
   prefetch_factor: 2
-  backbone_lr: 5.0e-5      # lower lr for pretrained backbone
-  head_lr: 1.0e-3          # higher lr for randomly initialized projection heads
+  backbone_lr: 2.0e-4      # scaled 4x for batch_size=256
+  head_lr: 4.0e-3          # scaled 4x for batch_size=256
   weight_decay: 1.0e-4
   lambda_global: 1.0
-  lambda_spatial: 1.0
+  lambda_spatial: 0.5      # reduce spatial weight — harder to match, drags global down
   lambda_logit: 0.15
-  target_cosine_sim: 0.85  # log when this threshold is reached
+  target_cosine_sim: 0.93  # log when this threshold is reached
   wandb_project: pantanal-monitoring
 
 student_mel:

@@ -1103,11 +1103,25 @@ This section tracks what is actually built, running, and missing. The pipeline h
 
 **Why:** Our current pipeline requires enough samples for GMM fitting (min_samples_per_component=20) — species below this threshold get no sub-cluster features. Prototypical probing has no such minimum.
 
+### E. Student Distillation — Convergence Improvements (not yet implemented)
+
+Ideas to push val_cos_sim beyond 0.92 (current best) toward 0.95+:
+
+1. **EMA (Exponential Moving Average)**: Keep a shadow model with exponentially averaged weights (decay ~0.999). EMA models smooth out mini-batch noise and almost always outperform final weights for distillation. Essentially free — ~20 lines, no extra training time. Expected gain: +0.5-1% cos_sim.
+
+2. **Hard example mining**: Once the model passes ~0.90, easy samples (loud, clear calls) contribute nearly zero gradient. Weight the loss by per-sample difficulty (1 - cos_sim) or drop samples where cos_sim > 0.98. Focuses GPU time on informative examples.
+
+3. **Projection head trick** (from SimCLR/BYOL): Train with a small MLP projection head on top (student → 512 → 1536), but discard it at inference and use pre-projection features. The projection head absorbs training artifacts, leaving cleaner representations.
+
+4. **Feature-level distillation**: Match intermediate backbone features in addition to final embeddings, giving the student richer gradient signal. Requires knowledge of Perch internals.
+
+5. **Separate global/spatial cos_sim logging**: The blended metric understates global quality. Global alone is likely ~0.96 cos_sim already — logging it separately would clarify how good prototype assignment really is.
+
 ### Immediate Next Steps (ordered)
 
-1. **Wait for `features.h5`** — check log for "Stage 3 complete"; then submit `train_classifier.sh` for each fold
-2. **Wait for job 322207** (`distill_embeddings.h5`) — then submit `train_student.sh`
-3. **Run pseudo-label round 1** — `sbatch scripts/pseudo_label.sh` (ROUND=1); wires the existing `data/pseudo_labels_*.csv` into the training pipeline as `.npz`
-4. **Validate student embedding alignment** — after training, check `val_cosine_sim` in logs; target > 0.85
-5. **Re-run `build_features.py` with student embeddings** — sanity check that prototype assignment quality holds before finalizing classifier
-6. **Submit inference** — run `src/inference.py` on test soundscapes to generate Kaggle submission CSV
+1. ~~Student distillation~~ — DONE (val_cos_sim=0.92, 60 epochs, batch_size=256, warmup+cosine LR)
+2. **Extract student embeddings** — `sbatch scripts/extract_student_embeddings.sh`
+3. **Rebuild features with student embeddings** — `python src/build_features.py --student`
+4. **Retrain classifier on student features** — `sbatch scripts/train_classifier.sh`
+5. **Package Kaggle submission** — bundle student ckpt + prototypes + classifier + inference.py
+6. **Submit inference** — Kaggle notebook runs `PantanalPredictor` on test soundscapes

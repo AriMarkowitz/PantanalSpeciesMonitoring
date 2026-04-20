@@ -311,8 +311,16 @@ def main(cfg: dict):
     ], weight_decay=scfg.get("weight_decay", 1e-4))
 
     max_epochs = scfg.get("epochs", 25)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=max_epochs
+    warmup_epochs = scfg.get("warmup_epochs", 5)
+    cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=max_epochs - warmup_epochs
+    )
+    warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+        optimizer, start_factor=0.1, end_factor=1.0, total_iters=warmup_epochs
+    )
+    scheduler = torch.optim.lr_scheduler.SequentialLR(
+        optimizer, schedulers=[warmup_scheduler, cosine_scheduler],
+        milestones=[warmup_epochs],
     )
     scaler = torch.amp.GradScaler("cuda") if use_amp else None
 
@@ -339,6 +347,8 @@ def main(cfg: dict):
     best_cos = 0.0
     best_epoch = -1
     cos_threshold = scfg.get("target_cosine_sim", 0.85)
+    patience = scfg.get("early_stop_patience", 10)
+    epochs_without_improvement = 0
 
     for epoch in range(max_epochs):
         train_metrics = train_one_epoch(model, train_dl, optimizer,
@@ -374,6 +384,7 @@ def main(cfg: dict):
         if val_cos > best_cos:
             best_cos = val_cos
             best_epoch = epoch + 1
+            epochs_without_improvement = 0
             job_id = os.environ.get("SLURM_JOB_ID", "local")
             ckpt_path = ckpt_dir / f"{job_id}_fold{fold}_cos={val_cos:.4f}_ep{epoch+1}.pt"
             torch.save({
@@ -387,7 +398,13 @@ def main(cfg: dict):
             logger.info(f"  → Best cos_sim={val_cos:.4f} → {ckpt_path}")
 
             if val_cos >= cos_threshold:
-                logger.info(f"  Target cosine similarity {cos_threshold} reached — consider early stopping")
+                logger.info(f"  Target cosine similarity {cos_threshold} reached")
+        else:
+            epochs_without_improvement += 1
+            if epochs_without_improvement >= patience:
+                logger.info(f"  Early stopping: no improvement for {patience} epochs "
+                            f"(best={best_cos:.4f} at epoch {best_epoch})")
+                break
 
     logger.info(f"Training complete. Best val_cos={best_cos:.4f} at epoch {best_epoch}")
     if run:

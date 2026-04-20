@@ -13,3 +13,4 @@ logs/
 02_agile_modeling.ipynb
 01_embed_audio.ipynb
 .gitignore
+.claude/*

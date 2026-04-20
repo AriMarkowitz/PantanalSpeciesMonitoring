@@ -274,22 +274,30 @@ def build_labels_and_masks(segments: pd.DataFrame, label_map: dict):
                     labels[i, label_map[sp]] = 1.0
 
         elif quality == "strong_primary":
-            # XC/iNat: primary label is positive, secondaries are positive
-            # but unlisted species are UNKNOWN (not negative)
             primary = str(row["primary_label"]).strip()
             if primary in label_map:
-                idx = label_map[primary]
-                labels[i, idx] = 1.0
-                masks[i, idx] = 1.0  # only supervise the primary species
+                # Target species focal recording: primary is positive,
+                # secondaries are positive, all other targets are supervised
+                # as negatives (focal recordings are dominated by the
+                # primary species — safe to assume other targets are absent).
+                masks[i, :] = 1.0
+                labels[i, label_map[primary]] = 1.0
 
-            # Secondary labels: positive where listed
-            secondaries = str(row.get("secondary_labels", ""))
-            if secondaries and secondaries != "nan":
-                for sp in secondaries.split(";"):
-                    sp = sp.strip()
-                    if sp in label_map:
-                        labels[i, label_map[sp]] = 1.0
-                        masks[i, label_map[sp]] = 1.0
+                # Secondary labels: positive where listed
+                secondaries = str(row.get("secondary_labels", ""))
+                if secondaries and secondaries != "nan":
+                    for sp in secondaries.split(";"):
+                        sp = sp.strip()
+                        if sp in label_map:
+                            labels[i, label_map[sp]] = 1.0
+            else:
+                # Non-target species focal recording: primary is NOT in
+                # the competition taxonomy. This recording is dominated by
+                # a non-target sound, so all 234 target species are treated
+                # as confirmed negatives — teaches the model to reject
+                # confusable non-target species.
+                masks[i, :] = 1.0
+                # labels already all zeros → all targets negative
 
     return labels, masks
 
@@ -319,6 +327,12 @@ def assign_folds(segments: pd.DataFrame, n_folds: int, seed: int = 42):
 
 
 def main(cfg: dict):
+    import argparse
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--student", action="store_true",
+                        help="Use student embeddings instead of Perch")
+    args, _ = parser.parse_known_args()
+
     logger = setup_logging("build_features", cfg["outputs"]["logs_dir"])
     logger.info("Stage 3: Motif Assignment & Feature Extraction")
 
@@ -353,19 +367,27 @@ def main(cfg: dict):
     species_gmms = load_species_gmms(cfg["outputs"]["prototypes_dir"])
     logger.info(f"Species GMMs: {len(species_gmms)}")
 
-    h5_emb = h5py.File(cfg["outputs"]["embeddings_h5"], "r")
+    # Choose embeddings source: student or Perch
+    if args.student:
+        emb_path = str(Path(cfg["outputs"]["embeddings_h5"]).parent / "student_embeddings.h5")
+        logger.info(f"Using STUDENT embeddings: {emb_path}")
+    else:
+        emb_path = cfg["outputs"]["embeddings_h5"]
+        logger.info(f"Using Perch embeddings: {emb_path}")
+
+    h5_emb = h5py.File(emb_path, "r")
     written = h5_emb["written"][:]
     has_spatial = "spatial_embeddings" in h5_emb
-    has_logits = "logit_values" in h5_emb
-    top_k = cfg["stage3"]["top_k_logits"]
 
     # Feature dimensionality
+    # NOTE: Perch logits were previously included here, but Perch cannot run
+    # on Kaggle CPU at inference time, so they are dropped entirely from the
+    # feature vector (rather than zero-filling and wasting 200 MLP inputs).
     feat_dim = (
         1536                    # global embedding
         + 3 * K_global          # motif histogram + max + spread
         + 1                     # noise fraction
         + 2 * num_species       # best subcluster match + entropy
-        + top_k                 # top Perch logits
     )
     logger.info(f"Feature dimension: {feat_dim}")
 
@@ -420,7 +442,6 @@ def main(cfg: dict):
     # Store feature layout as attributes
     h5_out.attrs["K_global"] = K_global
     h5_out.attrs["num_species"] = num_species
-    h5_out.attrs["top_k_logits"] = top_k
     h5_out.attrs["feat_dim"] = feat_dim
 
     # Process all segments — GMM features already computed, just look up
@@ -443,11 +464,6 @@ def main(cfg: dict):
         sp = spatial_embs_all  # already (M, L, 1536)
     else:
         sp = global_embs_all[:, np.newaxis, :]  # (M, 1, 1536)
-
-    if has_logits:
-        logit_vals_all = h5_emb["logit_values"][valid_idx_sorted].astype(np.float32)  # (M, top_k)
-    else:
-        logit_vals_all = np.zeros((len(valid_idx_sorted), top_k), dtype=np.float32)
 
     # ── Batched motif features ────────────────────────────────────────────────
     logger.info("Computing motif features (batched)")
@@ -489,7 +505,6 @@ def main(cfg: dict):
         noise_all[:, None],    # (M, 1)
         gmm_best_match_valid,  # (M, num_species)
         gmm_sub_ent_valid,     # (M, num_species)
-        logit_vals_all,        # (M, top_k)
     ], axis=1).astype(np.float32)
 
     # Write feature rows — use contiguous slice if all segments are valid (fast),
@@ -522,7 +537,7 @@ def main(cfg: dict):
     # Diagnostic: cluster→species association table
     # Reopens embeddings HDF5 read-only for a second pass over labeled data
     build_cluster_species_table(segments, labels, label_map, prototypes,
-                                h5_emb_path=cfg["outputs"]["embeddings_h5"],
+                                h5_emb_path=emb_path,
                                 out_dir=Path(cfg["outputs"]["prototypes_dir"]),
                                 logger=logger,
                                 metric=cfg["stage3"].get("similarity_metric", "cosine"),

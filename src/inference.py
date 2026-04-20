@@ -57,9 +57,10 @@ class PantanalPredictor:
                  classifier: MotifClassifier,
                  label_map: dict,
                  cfg: dict,
-                 device: torch.device):
+                 device: torch.device,
+                 project_fn=None):
         self.student = student.to(device).eval()
-        self.prototypes = prototypes          # (K, 1536) float32
+        self.prototypes = prototypes          # (K, proj_dim) float32
         self.species_gmms = species_gmms
         self.classifier = classifier.to(device).eval()
         self.label_map = label_map
@@ -67,12 +68,12 @@ class PantanalPredictor:
         self.cfg = cfg
         self.device = device
         self.num_classes = len(label_map)
+        self.project_fn = project_fn
 
         self.seg_dur = cfg["data"]["segment_duration"]
         self.sr = cfg["data"]["sample_rate"]
         self.metric = cfg["stage3"].get("similarity_metric", "cosine")
         self.temperature = cfg["stage3"].get("temperature", 0.1)
-        self.top_k = cfg["stage1"]["top_k_logits"]
         self.mel_cfg = cfg.get("student_mel", {})
 
     @classmethod
@@ -97,6 +98,21 @@ class PantanalPredictor:
         with open(gmm_path, "rb") as f:
             species_gmms = pickle.load(f)
 
+        # SupCon projection (if prototypes were built in projected space)
+        project_fn = None
+        used_supcon = bool(proto_data.get("used_supcon", False))
+        if used_supcon:
+            W_path = Path(prototypes_dir) / "supcon_W.npy"
+            if W_path.exists():
+                W = np.load(W_path)  # (proj_dim, 1536)
+                def project_fn(X):
+                    orig_shape = X.shape[:-1]
+                    flat = X.reshape(-1, X.shape[-1])
+                    z = flat @ W.T
+                    norms = np.linalg.norm(z, axis=1, keepdims=True)
+                    z = z / np.maximum(norms, 1e-8)
+                    return z.reshape(*orig_shape, W.shape[0])
+
         # Label map
         label_map = build_label_map(cfg["data"]["taxonomy_csv"])
 
@@ -114,32 +130,15 @@ class PantanalPredictor:
         classifier.load_state_dict(ckpt["model_state_dict"])
 
         return cls(student, prototypes, species_gmms, classifier,
-                   label_map, cfg, dev)
+                   label_map, cfg, dev, project_fn=project_fn)
 
     # ── Core embedding + feature computation ────────────────────────────────
 
     def _wav_to_mel(self, wav: np.ndarray) -> torch.Tensor:
         """Waveform → mel spectrogram tensor (1, n_mels, T)."""
-        import librosa
-        n_mels = self.mel_cfg.get("n_mels", 128)
-        hop = int(self.sr * self.mel_cfg.get("hop_ms", 10) / 1000)
-        win = int(self.sr * self.mel_cfg.get("win_ms", 25) / 1000)
-        fmin = self.mel_cfg.get("fmin", 60.0)
-        fmax = self.mel_cfg.get("fmax", 16000.0)
-
-        target_len = int(self.sr * self.seg_dur)
-        if len(wav) < target_len:
-            wav = np.pad(wav, (0, target_len - len(wav)))
-        else:
-            wav = wav[:target_len]
-
-        mel = librosa.feature.melspectrogram(
-            y=wav, sr=self.sr, n_mels=n_mels,
-            hop_length=hop, win_length=win, fmin=fmin, fmax=fmax, power=2.0,
-        )
-        mel = librosa.power_to_db(mel, ref=np.max).astype(np.float32)
-        mel = (mel - mel.min()) / (mel.max() - mel.min() + 1e-8)
-        return torch.from_numpy(mel).unsqueeze(0)  # (1, n_mels, T)
+        from cache_mels import wav_to_mel_np
+        mel = wav_to_mel_np(wav, self.sr, self.mel_cfg)  # (n_mels, T)
+        return torch.from_numpy(mel).unsqueeze(0).float()  # (1, n_mels, T)
 
     @torch.no_grad()
     def _embed_batch(self, wavs: list[np.ndarray]) -> tuple[np.ndarray, np.ndarray]:
@@ -147,7 +146,7 @@ class PantanalPredictor:
 
         Returns:
             global_embs: (B, 1536)
-            spatial_embs: (B, 5, 3, 1536)
+            spatial_embs: (B, 5, 1536)
         """
         mels = torch.stack([self._wav_to_mel(w) for w in wavs]).to(self.device)
         g, s = self.student(mels, normalize=True)
@@ -155,21 +154,33 @@ class PantanalPredictor:
 
     def _build_feature(self, global_emb: np.ndarray,
                         spatial_emb: np.ndarray) -> np.ndarray:
-        """Build 8349-D feature vector for one segment."""
+        """Build feature vector for one segment.
+
+        If SupCon projection is available, project embeddings into the
+        prototype space before computing motif/GMM features. The raw
+        1536-D global embedding is still prepended to the feature vector
+        (matching build_features.py behavior).
+        """
+        # Project into SupCon space for prototype comparison
+        if self.project_fn is not None:
+            spatial_proj = self.project_fn(spatial_emb)
+            global_proj = self.project_fn(global_emb.reshape(1, -1))[0]
+        else:
+            spatial_proj = spatial_emb
+            global_proj = global_emb
+
         hist, max_act, spread, noise = compute_global_motif_features(
-            spatial_emb, self.prototypes,
+            spatial_proj, self.prototypes,
             temperature=self.temperature,
             metric=self.metric,
         )
         best_match, sub_ent = compute_species_subcluster_features(
-            global_emb, self.species_gmms, self.label_map,
+            global_proj, self.species_gmms, self.label_map,
         )
-        # No Perch logits at inference — use zeros for that slot
-        logit_vals = np.zeros(self.top_k, dtype=np.float32)
 
         return np.concatenate([
             global_emb, hist, max_act, spread, [noise],
-            best_match, sub_ent, logit_vals,
+            best_match, sub_ent,
         ]).astype(np.float32)
 
     @torch.no_grad()
@@ -236,7 +247,8 @@ class PantanalPredictor:
             all_probs.append(probs)
 
             for s in starts_batch:
-                row_id = f"{filename}_{int(s)}"
+                end_sec = int(s + self.seg_dur)
+                row_id = f"{Path(audio_path).stem}_{end_sec}"
                 all_row_ids.append(row_id)
 
         all_probs = np.concatenate(all_probs, axis=0)

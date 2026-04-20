@@ -1,0 +1,13 @@
+{
+  "id": "arimarkowitz/birdclef-2026-pantanal-inference",
+  "title": "BirdCLEF 2026 Pantanal Inference",
+  "code_file": "kaggle_submission.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": false,
+  "enable_internet": false,
+  "competition_sources": ["birdclef-2026"],
+  "dataset_sources": ["arimarkowitz/pantanal-artifacts"],
+  "kernel_data_sources": ["arimarkowitz/pantanal-artifacts"]
+}
