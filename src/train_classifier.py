@@ -35,7 +35,21 @@ def compute_macro_auc(y_true: np.ndarray, y_pred: np.ndarray) -> float:
     return np.mean(aucs) if aucs else 0.0
 
 
-def train_one_epoch(model, loader, optimizer, criterion, device):
+def mixup_batch(feats, labels, masks, alpha=0.2):
+    """Feature-space mixup: blend pairs of samples with random weight."""
+    if alpha <= 0:
+        return feats, labels, masks
+    lam = torch.distributions.Beta(alpha, alpha).sample().item()
+    lam = max(lam, 1.0 - lam)  # ensure lam >= 0.5 so first sample dominates
+    perm = torch.randperm(feats.size(0), device=feats.device)
+    feats = lam * feats + (1.0 - lam) * feats[perm]
+    labels = lam * labels + (1.0 - lam) * labels[perm]
+    masks = torch.max(masks, masks[perm])  # supervise if either sample is supervised
+    return feats, labels, masks
+
+
+def train_one_epoch(model, loader, optimizer, criterion, device,
+                    mixup_alpha=0.2):
     model.train()
     total_loss = 0.0
     n_batches = 0
@@ -44,6 +58,8 @@ def train_one_epoch(model, loader, optimizer, criterion, device):
         feats = feats.to(device)
         labels = labels.to(device)
         masks = masks.to(device)
+
+        feats, labels, masks = mixup_batch(feats, labels, masks, mixup_alpha)
 
         logits = model(feats)
         loss = criterion(logits, labels, masks)
@@ -122,11 +138,23 @@ def main(cfg: dict):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Device: {device}")
 
-    # Data
+    # Data — optionally load pseudo-labels
     h5_path = cfg["outputs"]["features_h5"]
+    pseudo_labels = None
+    pseudo_weight = cfg["stage4b"]["pseudo_weight"]
+    pseudo_path = os.environ.get("PSEUDO_LABELS", "")
+    if pseudo_path and Path(pseudo_path).exists():
+        pseudo_labels = np.load(pseudo_path)["pseudo_labels"]
+        logger.info(f"Loaded pseudo-labels from {pseudo_path}: "
+                    f"{(pseudo_labels > 0).sum()} non-zero entries, "
+                    f"{(pseudo_labels.sum(axis=1) > 0).sum()} segments, "
+                    f"weight={pseudo_weight}")
+
     train_dl, val_dl = get_dataloaders(
         h5_path, fold=fold, batch_size=tcfg["batch_size"],
         n_folds=tcfg["n_folds"],
+        pseudo_labels=pseudo_labels,
+        pseudo_weight=pseudo_weight,
     )
     feat_dim = train_dl.dataset.feat_dim
     num_classes = train_dl.dataset.num_classes
@@ -208,7 +236,8 @@ def main(cfg: dict):
 
     # Training loop
     for epoch in range(tcfg["max_epochs"]):
-        train_loss = train_one_epoch(model, train_dl, optimizer, criterion, device)
+        train_loss = train_one_epoch(model, train_dl, optimizer, criterion, device,
+                                     mixup_alpha=tcfg.get("mixup_alpha", 0.0))
         val_loss, val_auc = evaluate(model, val_dl, criterion, device)
         lr = optimizer.param_groups[0]["lr"]
         scheduler.step()

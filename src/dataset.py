@@ -55,7 +55,11 @@ class FeatureDataset(Dataset):
                 confident = pl > 0  # pseudo-label is present
                 if confident.any():
                     self.labels[i] = pl
-                    self.masks[i, confident] = pseudo_weight
+                    # Supervise ALL classes for pseudo-labeled segments:
+                    # confident classes get pseudo_weight, non-confident classes
+                    # are treated as negatives (also at pseudo_weight, since we
+                    # trust the model's "this species is absent" equally).
+                    self.masks[i, :] = pseudo_weight
 
         self.feat_dim = self.features.shape[1]
         self.num_classes = self.labels.shape[1]

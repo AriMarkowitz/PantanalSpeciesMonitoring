@@ -71,8 +71,9 @@ stage4:
   dropout: 0.5
   lr: 1.0e-3
   weight_decay: 1.0e-3
-  max_epochs: 20
-  early_stop_patience: 5
+  max_epochs: 30
+  early_stop_patience: 7
+  mixup_alpha: 0.2
   batch_size: 512
   n_folds: 5
   loss: asl
