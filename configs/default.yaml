@@ -20,6 +20,7 @@ outputs:
   features_h5: outputs/features/features.h5
   checkpoints_dir: outputs/checkpoints
   pseudo_labels_dir: outputs/pseudo_labels
+  nmf_dir: outputs/nmf_per_class
   logs_dir: outputs/logs
 
 stage0:
@@ -113,3 +114,22 @@ stage4b:
   self_train_threshold: 0.85
   pseudo_weight: 0.5
   use_perch_logits_round1: true
+
+stage_nmf_pc:
+  # Per-species NMFk dictionaries. Each species gets its own W_sp (128 mels, k_sp)
+  # trained on its strong_primary segments. At inference we use pseudoinverse
+  # projection (one matmul per stacked W_pinv) to extract per-species
+  # reconstruction-quality + activation-energy signals → 2 * num_species features.
+  max_clips_per_species: 50      # cap clips per species for W_sp training
+  min_clips_per_species: 4       # species with fewer clips fall back to shared W
+  k_min: 4
+  k_max: 24
+  k_step: 4
+  n_runs_per_k: 3                # fewer runs than global NMFk: many species, keep fast
+  nmf_max_iter: 400
+  perturb_std: 0.01
+  algo: hals                     # pyNMFk GPU solver — "hals" (default), "halsvar", "mu", or "bpp"
+  silhouette_min: 0.5
+  project_batch_size: 2048       # segments per batched pinv projection
+  feature_mode: recon_goodness   # per species: recon_err + neg_frac + energy + pos_energy → 4*num_species dim
+  mel_floor_db: -80.0

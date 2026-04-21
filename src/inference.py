@@ -41,6 +41,7 @@ from build_features import (
     compute_global_motif_features,
     compute_species_subcluster_features,
 )
+from nmf_per_class import project_segments_to_features
 
 
 class PantanalPredictor:
@@ -58,7 +59,10 @@ class PantanalPredictor:
                  label_map: dict,
                  cfg: dict,
                  device: torch.device,
-                 project_fn=None):
+                 project_fn=None,
+                 nmf_W_all: np.ndarray | None = None,
+                 nmf_W_all_pinv: np.ndarray | None = None,
+                 nmf_boundaries: np.ndarray | None = None):
         self.student = student.to(device).eval()
         self.prototypes = prototypes          # (K, proj_dim) float32
         self.species_gmms = species_gmms
@@ -69,6 +73,11 @@ class PantanalPredictor:
         self.device = device
         self.num_classes = len(label_map)
         self.project_fn = project_fn
+
+        # Optional per-class NMF dictionaries
+        self.nmf_W_all = nmf_W_all
+        self.nmf_W_all_pinv = nmf_W_all_pinv
+        self.nmf_boundaries = nmf_boundaries
 
         self.seg_dur = cfg["data"]["segment_duration"]
         self.sr = cfg["data"]["sample_rate"]
@@ -129,37 +138,59 @@ class PantanalPredictor:
         )
         classifier.load_state_dict(ckpt["model_state_dict"])
 
+        # Optional per-class NMF dictionaries (stage_nmf_pc)
+        nmf_W_all = nmf_W_all_pinv = nmf_boundaries = None
+        nmf_dir_cfg = cfg["outputs"].get("nmf_dir", "")
+        nmf_candidates = [Path(nmf_dir_cfg)] if nmf_dir_cfg else []
+        # Also look next to the classifier checkpoint (packaged artifacts)
+        nmf_candidates.append(Path(classifier_ckpt).parent)
+        for nmf_dir in nmf_candidates:
+            if (nmf_dir / "W_all_pinv.npy").exists():
+                nmf_W_all_pinv = np.load(nmf_dir / "W_all_pinv.npy")
+                nmf_boundaries = np.load(nmf_dir / "species_boundaries.npy")
+                if (nmf_dir / "W_all.npy").exists():
+                    nmf_W_all = np.load(nmf_dir / "W_all.npy")
+                break
+
         return cls(student, prototypes, species_gmms, classifier,
-                   label_map, cfg, dev, project_fn=project_fn)
+                   label_map, cfg, dev, project_fn=project_fn,
+                   nmf_W_all=nmf_W_all, nmf_W_all_pinv=nmf_W_all_pinv,
+                   nmf_boundaries=nmf_boundaries)
 
     # ── Core embedding + feature computation ────────────────────────────────
 
-    def _wav_to_mel(self, wav: np.ndarray) -> torch.Tensor:
-        """Waveform → mel spectrogram tensor (1, n_mels, T)."""
+    def _wav_to_mel(self, wav: np.ndarray) -> np.ndarray:
+        """Waveform → mel spectrogram (n_mels, T) numpy."""
         from cache_mels import wav_to_mel_np
-        mel = wav_to_mel_np(wav, self.sr, self.mel_cfg)  # (n_mels, T)
-        return torch.from_numpy(mel).unsqueeze(0).float()  # (1, n_mels, T)
+        return wav_to_mel_np(wav, self.sr, self.mel_cfg)  # (n_mels, T)
 
     @torch.no_grad()
-    def _embed_batch(self, wavs: list[np.ndarray]) -> tuple[np.ndarray, np.ndarray]:
-        """Embed a batch of waveforms → (global_embs, spatial_embs).
+    def _embed_batch(self, wavs: list[np.ndarray]
+                     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Embed a batch of waveforms → (global_embs, spatial_embs, mels).
 
         Returns:
             global_embs: (B, 1536)
             spatial_embs: (B, 5, 1536)
+            mels:        (B, n_mels, T) float32 — reused for NMF features
         """
-        mels = torch.stack([self._wav_to_mel(w) for w in wavs]).to(self.device)
-        g, s = self.student(mels, normalize=True)
-        return g.cpu().numpy(), s.cpu().numpy()
+        mels_np = np.stack([self._wav_to_mel(w) for w in wavs])  # (B, n_mels, T)
+        mels_t = torch.from_numpy(mels_np).unsqueeze(1).float().to(self.device)
+        g, s = self.student(mels_t, normalize=True)
+        return g.cpu().numpy(), s.cpu().numpy(), mels_np
 
     def _build_feature(self, global_emb: np.ndarray,
-                        spatial_emb: np.ndarray) -> np.ndarray:
+                        spatial_emb: np.ndarray,
+                        nmf_feat: np.ndarray | None = None) -> np.ndarray:
         """Build feature vector for one segment.
 
         If SupCon projection is available, project embeddings into the
         prototype space before computing motif/GMM features. The raw
         1536-D global embedding is still prepended to the feature vector
         (matching build_features.py behavior).
+
+        nmf_feat: optional (2*num_species,) per-class NMF features appended
+        after the subcluster features (matches build_features.py layout).
         """
         # Project into SupCon space for prototype comparison
         if self.project_fn is not None:
@@ -178,10 +209,21 @@ class PantanalPredictor:
             global_proj, self.species_gmms, self.label_map,
         )
 
-        return np.concatenate([
-            global_emb, hist, max_act, spread, [noise],
-            best_match, sub_ent,
-        ]).astype(np.float32)
+        parts = [global_emb, hist, max_act, spread, np.array([noise]),
+                 best_match, sub_ent]
+        if nmf_feat is not None:
+            parts.append(nmf_feat)
+        return np.concatenate(parts).astype(np.float32)
+
+    def _compute_nmf_batch(self, mels: np.ndarray) -> np.ndarray | None:
+        """Compute (B, 2*num_species) NMF features for a batch, or None."""
+        if (self.nmf_W_all is None or self.nmf_W_all_pinv is None
+                or self.nmf_boundaries is None):
+            return None
+        mels_nn = np.maximum(mels.astype(np.float32), 0.0)
+        return project_segments_to_features(
+            mels_nn, self.nmf_W_all, self.nmf_W_all_pinv, self.nmf_boundaries,
+        )
 
     @torch.no_grad()
     def _classify_features(self, features: np.ndarray) -> np.ndarray:
@@ -236,10 +278,14 @@ class PantanalPredictor:
             starts_batch = [b[0] for b in batch]
             wavs_batch = [b[1] for b in batch]
 
-            global_embs, spatial_embs = self._embed_batch(wavs_batch)
+            global_embs, spatial_embs, mels_batch = self._embed_batch(wavs_batch)
+            nmf_batch = self._compute_nmf_batch(mels_batch)
 
             features = np.stack([
-                self._build_feature(global_embs[j], spatial_embs[j])
+                self._build_feature(
+                    global_embs[j], spatial_embs[j],
+                    nmf_feat=None if nmf_batch is None else nmf_batch[j],
+                )
                 for j in range(len(wavs_batch))
             ])
 

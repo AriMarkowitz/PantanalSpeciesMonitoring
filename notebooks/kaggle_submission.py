@@ -227,6 +227,46 @@ def compute_global_motif_features(spatial_emb, prototypes,
     return hist, max_act, spread, noise
 
 
+def project_nmf_features(mels_chunk, W_all, W_all_pinv, boundaries):
+    """Per-segment per-species pseudoinverse projection features.
+
+    Mirrors src/nmf_per_class.project_segments_to_features — see that for
+    algorithmic detail. Layout:
+      [recon_err_0..S-1, neg_frac_0..S-1, energy_0..S-1, pos_energy_0..S-1].
+    """
+    B, n_mels, T = mels_chunk.shape
+    num_species = len(boundaries) - 1
+
+    V_flat = mels_chunk.transpose(1, 0, 2).reshape(n_mels, B * T)
+    H_flat = W_all_pinv @ V_flat
+    sum_k = H_flat.shape[0]
+    H_all = H_flat.reshape(sum_k, B, T).transpose(1, 0, 2)
+
+    V_sq = (mels_chunk ** 2).sum(axis=(1, 2))
+    V_sq_safe = np.maximum(V_sq, 1e-10)
+
+    recon_err = np.zeros((B, num_species), dtype=np.float32)
+    neg_frac = np.zeros((B, num_species), dtype=np.float32)
+    energy = np.zeros((B, num_species), dtype=np.float32)
+    pos_energy = np.zeros((B, num_species), dtype=np.float32)
+    for sp_idx in range(num_species):
+        c0, c1 = int(boundaries[sp_idx]), int(boundaries[sp_idx + 1])
+        if c1 <= c0:
+            continue
+        W_sp = W_all[:, c0:c1]
+        H_sp = H_all[:, c0:c1, :]
+        V_hat = np.einsum("fk,bkt->bft", W_sp, H_sp)
+        diff = mels_chunk - V_hat
+        err_sq = (diff ** 2).sum(axis=(1, 2))
+        recon_err[:, sp_idx] = (err_sq / V_sq_safe).astype(np.float32)
+        k_sp_T = max(H_sp.shape[1] * H_sp.shape[2], 1)
+        neg_frac[:, sp_idx] = ((H_sp < 0).sum(axis=(1, 2)) / k_sp_T).astype(np.float32)
+        energy[:, sp_idx] = (H_sp ** 2).sum(axis=(1, 2)).astype(np.float32)
+        pos_energy[:, sp_idx] = (np.maximum(H_sp, 0.0) ** 2).sum(axis=(1, 2)).astype(np.float32)
+
+    return np.concatenate([recon_err, neg_frac, energy, pos_energy], axis=1)
+
+
 def compute_species_subcluster_features(global_emb, species_gmms, label_map):
     num_species = len(label_map)
     best_match = np.full(num_species, -100.0, dtype=np.float32)
@@ -279,6 +319,20 @@ def project_fn(X):
 with open(os.path.join(ARTIFACTS, "species_gmms.pkl"), "rb") as f:
     species_gmms = pickle.load(f)
 
+# Optional per-class NMF dictionaries
+NMF_W_ALL = NMF_W_ALL_PINV = NMF_BOUNDARIES = None
+_nmf_pinv_path = os.path.join(ARTIFACTS, "W_all_pinv.npy")
+if os.path.isfile(_nmf_pinv_path):
+    NMF_W_ALL_PINV = np.load(_nmf_pinv_path)
+    NMF_BOUNDARIES = np.load(os.path.join(ARTIFACTS, "species_boundaries.npy"))
+    _w_all_path = os.path.join(ARTIFACTS, "W_all.npy")
+    if os.path.isfile(_w_all_path):
+        NMF_W_ALL = np.load(_w_all_path)
+    print(f"  NMF per-class: W_all_pinv {NMF_W_ALL_PINV.shape}, "
+          f"{len(NMF_BOUNDARIES) - 1} species dictionaries")
+else:
+    print("  NMF per-class: not present (classifier will run without NMF features)")
+
 print("Loading classifier...")
 cls_ckpt = torch.load(os.path.join(ARTIFACTS, "classifier_best.pt"),
                        map_location="cpu", weights_only=False)
@@ -323,18 +377,23 @@ def segment_audio(audio):
 
 # ── Inference ───────────────────────────────────────────────────────────────
 def embed_batch(waveforms):
-    """Batch of waveforms (B, samples) -> global (B, 1536), spatial (B, 5, 1536)."""
-    mels = []
-    for w in waveforms:
-        mel = wav_to_mel_np(w, SAMPLE_RATE, MEL_CFG)
-        mels.append(torch.from_numpy(mel).unsqueeze(0).float())
-    mels_t = torch.stack(mels)  # (B, 1, n_mels, T)
+    """Batch of waveforms (B, samples) -> global (B, 1536), spatial (B, 5, 1536), mels (B, n_mels, T)."""
+    mels_np = np.stack([wav_to_mel_np(w, SAMPLE_RATE, MEL_CFG) for w in waveforms])  # (B, n_mels, T)
+    mels_t = torch.from_numpy(mels_np).unsqueeze(1).float()  # (B, 1, n_mels, T)
     g, s = student(mels_t, normalize=True)
-    return g.numpy(), s.numpy()
+    return g.numpy(), s.numpy(), mels_np
 
 
-def build_features_batch(global_embs, spatial_embs):
+def build_features_batch(global_embs, spatial_embs, mels_batch=None):
     """Build feature vectors for a batch of segments."""
+    nmf_batch = None
+    if (mels_batch is not None and NMF_W_ALL is not None
+            and NMF_W_ALL_PINV is not None and NMF_BOUNDARIES is not None):
+        mels_nn = np.maximum(mels_batch.astype(np.float32), 0.0)
+        nmf_batch = project_nmf_features(
+            mels_nn, NMF_W_ALL, NMF_W_ALL_PINV, NMF_BOUNDARIES,
+        )
+
     features = []
     for j in range(len(global_embs)):
         g = global_embs[j]
@@ -349,10 +408,10 @@ def build_features_batch(global_embs, spatial_embs):
         best_match, sub_ent = compute_species_subcluster_features(
             g_proj, species_gmms, label_map)
 
-        feat = np.concatenate([
-            g, hist, max_act, spread, [noise],
-            best_match, sub_ent,
-        ]).astype(np.float32)
+        parts = [g, hist, max_act, spread, [noise], best_match, sub_ent]
+        if nmf_batch is not None:
+            parts.append(nmf_batch[j])
+        feat = np.concatenate(parts).astype(np.float32)
         features.append(feat)
     return np.stack(features)
 
@@ -403,8 +462,8 @@ def main():
         for batch_start in range(0, n_segments, BATCH_SIZE):
             batch = segments[batch_start:batch_start + BATCH_SIZE]
 
-            global_embs, spatial_embs = embed_batch(batch)
-            features = build_features_batch(global_embs, spatial_embs)
+            global_embs, spatial_embs, mels_batch = embed_batch(batch)
+            features = build_features_batch(global_embs, spatial_embs, mels_batch)
             probs = classify_features(features)
 
             # Reorder columns to match submission format

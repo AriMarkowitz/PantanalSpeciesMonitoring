@@ -379,6 +379,22 @@ def main(cfg: dict):
     written = h5_emb["written"][:]
     has_spatial = "spatial_embeddings" in h5_emb
 
+    # Optional: per-class NMF features (stage_nmf_pc)
+    # Adds 2 * num_species features per segment: [recon_error_sp, activation_energy_sp]
+    nmf_features = None
+    nmf_dir = Path(cfg["outputs"].get("nmf_dir", ""))
+    nmf_path = nmf_dir / "nmf_features.npy"
+    if nmf_dir and nmf_path.exists():
+        nmf_features = np.load(nmf_path)  # (N, 2*num_species)
+        if nmf_features.shape[0] != len(segments):
+            logger.warning(
+                f"NMF features shape mismatch: {nmf_features.shape[0]} rows "
+                f"vs {len(segments)} segments. Skipping NMF features."
+            )
+            nmf_features = None
+        else:
+            logger.info(f"Loaded NMF features: {nmf_features.shape} from {nmf_path}")
+
     # Feature dimensionality
     # NOTE: Perch logits were previously included here, but Perch cannot run
     # on Kaggle CPU at inference time, so they are dropped entirely from the
@@ -389,6 +405,8 @@ def main(cfg: dict):
         + 1                     # noise fraction
         + 2 * num_species       # best subcluster match + entropy
     )
+    if nmf_features is not None:
+        feat_dim += nmf_features.shape[1]   # 2 * num_species (recon + energy)
     logger.info(f"Feature dimension: {feat_dim}")
 
     # Build labels and masks
@@ -497,7 +515,7 @@ def main(cfg: dict):
 
     # ── Assemble and write feature matrix ────────────────────────────────────
     logger.info("Assembling and writing feature matrix")
-    feat_matrix = np.concatenate([
+    parts = [
         global_embs_all,       # (M, 1536)
         hist_all,              # (M, K_global)
         max_act_all,           # (M, K_global)
@@ -505,7 +523,11 @@ def main(cfg: dict):
         noise_all[:, None],    # (M, 1)
         gmm_best_match_valid,  # (M, num_species)
         gmm_sub_ent_valid,     # (M, num_species)
-    ], axis=1).astype(np.float32)
+    ]
+    if nmf_features is not None:
+        # nmf_features is (N, 2*num_species); slice to valid indices to align
+        parts.append(nmf_features[valid_idx_sorted].astype(np.float32))
+    feat_matrix = np.concatenate(parts, axis=1).astype(np.float32)
 
     # Write feature rows — use contiguous slice if all segments are valid (fast),
     # otherwise fall back to chunked fancy indexing (slower but correct).

@@ -32,6 +32,18 @@ cp "$PROJECT_DIR/outputs/prototypes/supcon_W.npy" "$OUT_DIR/"
 # EfficientNet backbone (for offline inference)
 cp "$PROJECT_DIR/outputs/efficientnet_b1_birdset/"* "$OUT_DIR/efficientnet_b1_birdset/"
 
+# Per-class NMF dictionaries (optional — only if built).
+NMF_DIR="$PROJECT_DIR/outputs/nmf_per_class"
+if [ -f "$NMF_DIR/W_all_pinv.npy" ]; then
+    echo "Including per-class NMF dictionaries"
+    cp "$NMF_DIR/W_all.npy"               "$OUT_DIR/"
+    cp "$NMF_DIR/W_all_pinv.npy"          "$OUT_DIR/"
+    cp "$NMF_DIR/species_boundaries.npy"  "$OUT_DIR/"
+    cp "$NMF_DIR/species_order.json"      "$OUT_DIR/"
+else
+    echo "No per-class NMF dictionaries at $NMF_DIR — skipping"
+fi
+
 # Config and taxonomy
 cp "$PROJECT_DIR/configs/default.yaml" "$OUT_DIR/config.yaml"
 cp "$PROJECT_DIR/data/taxonomy.csv" "$OUT_DIR/"
