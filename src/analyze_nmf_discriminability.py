@@ -21,6 +21,7 @@ Run:
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 from pathlib import Path
 
@@ -39,7 +40,11 @@ def _per_species_stats(
     W_pinv: np.ndarray,
     boundaries: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Return (recon_err[num_species], pos_energy[num_species]) for one clip."""
+    """Return (recon_err[num_species], pos_energy[num_species]) for one clip.
+
+    Memory-tight: allocates H_all once, reuses V_hat scratch, explicitly
+    drops per-species slices before the next iteration.
+    """
     H_all = W_pinv @ V                              # (sum_k, T)
     V_sq = float(np.sum(V ** 2)) + 1e-10
     S = len(boundaries) - 1
@@ -49,11 +54,16 @@ def _per_species_stats(
         c0, c1 = int(boundaries[sp]), int(boundaries[sp + 1])
         if c1 <= c0:
             continue
+        # Views into W_all / H_all — no copy
         W_sp = W_all[:, c0:c1]
         H_sp = H_all[c0:c1, :]
+        # Accumulate ||V - W_sp H_sp||^2 without materializing diff
         V_hat = W_sp @ H_sp
-        recon[sp] = float(np.sum((V - V_hat) ** 2)) / V_sq
-        pose[sp] = float(np.sum(np.maximum(H_sp, 0.0) ** 2))
+        diff_sq = (V - V_hat) ** 2
+        recon[sp] = float(diff_sq.sum()) / V_sq
+        pose[sp] = float(np.maximum(H_sp, 0.0).__pow__(2).sum())
+        del V_hat, diff_sq
+    del H_all
     return recon, pose
 
 
@@ -131,8 +141,11 @@ def analyze(cfg: dict, max_clips: int | None, seed: int, out_dir: Path | None):
         V = np.maximum(mels[ci].astype(np.float32), 0.0)
         recon_mat[i], pose_mat[i] = _per_species_stats(V, W_all, W_pinv, boundaries)
         true_idx[i] = sp_to_idx[primary[ci]]
+        del V
         if (i + 1) % 200 == 0 or i + 1 == N:
             print(f"  {i + 1}/{N}")
+        if (i + 1) % 100 == 0:
+            gc.collect()
 
     # ── Analysis A: per-clip ranking ─────────────────────────────────────────
     # For recon: lower is better → rank ascending

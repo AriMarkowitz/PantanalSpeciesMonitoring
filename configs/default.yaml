@@ -129,8 +129,9 @@ stage_nmf_pc:
   nmf_max_iter: 400
   perturb_std: 0.01
   algo: hals                     # pyNMFk GPU solver — "hals" (default), "halsvar", "mu", or "bpp"
-  silhouette_min: 0.3            # gate for "stable enough"; final pick is lowest rel_error among stable
-  k_selection: rel_error         # "rel_error" (prefer expressive, stable-enough W) or "silhouette" (legacy)
-  project_batch_size: 2048       # segments per batched pinv projection
+  silhouette_min: 0.5            # NMFk.jl cutoff: robustness = min(cluster silhouettes) must exceed this
+  k_selection: nmfk              # "nmfk" = canonical NMFk.jl rule (largest k with robustness > cutoff)
+  k_strict: true                 # if no k passes cutoff, fall back to max-robustness k (NMFk.jl: strict=false behavior)
+  project_batch_size: 128        # segments per batched pinv projection (sum_k can be >20k → H_flat scales with sum_k × B × T, keep small)
   feature_mode: recon_goodness   # per species: recon_err + neg_frac + energy + pos_energy → 4*num_species dim
   mel_floor_db: -80.0

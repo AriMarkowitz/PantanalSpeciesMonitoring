@@ -85,16 +85,22 @@ def _gather_species_matrix(species_label: str,
     return V
 
 
-def _nmfk_silhouette(W_runs: list[np.ndarray]) -> float:
-    """NMFk-style silhouette stability across runs via Hungarian matching.
+def _nmfk_cluster_silhouettes(W_runs: list[np.ndarray]) -> np.ndarray:
+    """NMFk.jl-style per-cluster silhouettes (cosine on component vectors).
 
-    Returns mean silhouette of component vectors (aligned across runs).
+    For each k-value run, components are aligned to the first run's
+    components via Hungarian matching on cosine similarity, then the k
+    resulting clusters of size ``n_runs`` are silhouette-scored separately.
+
+    Returns an array of length k — one silhouette per cluster.
+    NMFk.jl uses robustness = min(cluster_silhouettes) to enforce that
+    ALL components are stable, not just the average.
     """
     from scipy.optimize import linear_sum_assignment
-    from sklearn.metrics import silhouette_score
+    from sklearn.metrics import silhouette_samples
 
     if len(W_runs) < 2:
-        return 1.0
+        return np.ones(W_runs[0].shape[1], dtype=np.float64)
     k = W_runs[0].shape[1]
     W_ref = W_runs[0]
     W_ref_n = W_ref / (np.linalg.norm(W_ref, axis=0, keepdims=True) + 1e-10)
@@ -114,9 +120,16 @@ def _nmfk_silhouette(W_runs: list[np.ndarray]) -> float:
             labels.append(j)
     X = np.array(vectors)
     y = np.array(labels)
-    if len(np.unique(y)) < 2:
-        return 1.0
-    return float(silhouette_score(X, y, metric="cosine"))
+    if len(np.unique(y)) < 2 or len(X) <= k:
+        return np.ones(k, dtype=np.float64)
+
+    # Per-sample silhouettes, then average within each cluster
+    s = silhouette_samples(X, y, metric="cosine")
+    per_cluster = np.zeros(k, dtype=np.float64)
+    for j in range(k):
+        sj = s[y == j]
+        per_cluster[j] = float(sj.mean()) if sj.size > 0 else 1.0
+    return per_cluster
 
 
 def _run_nmf_once(V: np.ndarray, k: int, max_iter: int,
@@ -148,15 +161,21 @@ def _select_k_for_species(V: np.ndarray, k_min: int, k_max: int, k_step: int,
                            silhouette_min: float, seed: int,
                            algo: str = "hals",
                            use_gpu: bool = True,
-                           selection: str = "rel_error") -> tuple[int, np.ndarray, dict]:
+                           selection: str = "nmfk",
+                           strict: bool = True) -> tuple[int, np.ndarray, dict]:
     """NMFk rank selection for one species. Returns (best_k, best_W, diagnostics).
 
     selection:
-      "rel_error"  — lowest mean_rel_error among candidates with silhouette
-                     >= silhouette_min (fallback: all candidates). This lets
-                     dictionaries grow as large as is stable, avoiding the
-                     "silhouette-favors-small-k" trap.
-      "silhouette" — highest silhouette, tie-break by lower error (legacy).
+      "nmfk"       — canonical NMFk.jl rule: robustness = min(cluster
+                     silhouettes); pick the LARGEST k whose robustness exceeds
+                     silhouette_min (the cutoff). If strict=False and none
+                     pass, fall back to max-robustness k. This is the
+                     published algorithm — prefers the most detailed
+                     factorization that is stable across restarts.
+      "rel_error"  — lowest mean_rel_error among stable candidates (legacy;
+                     trivially picks k_max because error decreases with k).
+      "silhouette" — highest mean silhouette, tie-break by lower error
+                     (legacy; biased toward small k).
     """
     # Clamp k_max to what the matrix can support (k ≤ min(f, T))
     f, T = V.shape
@@ -183,12 +202,16 @@ def _select_k_for_species(V: np.ndarray, k_min: int, k_max: int, k_step: int,
             errs.append(err)
         if not W_runs:
             continue
-        sil = _nmfk_silhouette(W_runs)
+        # Per-cluster silhouettes; NMFk robustness = min across clusters
+        cluster_sils = _nmfk_cluster_silhouettes(W_runs)
+        robustness = float(cluster_sils.min())
+        mean_sil = float(cluster_sils.mean())
         best_run = int(np.argmin(errs))
         best_W_per_k[k] = W_runs[best_run]
         results.append({
             "k": k,
-            "silhouette": sil,
+            "robustness": robustness,      # min cluster silhouette (NMFk.jl rule)
+            "mean_silhouette": mean_sil,   # for diagnostics
             "mean_rel_error": float(np.mean(errs)),
             "std_rel_error": float(np.std(errs)),
         })
@@ -201,15 +224,30 @@ def _select_k_for_species(V: np.ndarray, k_min: int, k_max: int, k_step: int,
                                 algo=algo, use_gpu=use_gpu)
         return W.shape[1], W, {"fallback": True, "results": []}
 
-    # Candidates: prefer stable runs (silhouette >= threshold); else fall back to all
-    stable = [r for r in results if r["silhouette"] >= silhouette_min]
-    if not stable:
-        stable = results
-
-    if selection == "silhouette":
-        best = max(stable, key=lambda r: (r["silhouette"], -r["mean_rel_error"]))
-    else:  # "rel_error": pick lowest reconstruction error among stable candidates
-        best = min(stable, key=lambda r: (r["mean_rel_error"], -r["silhouette"]))
+    if selection == "nmfk":
+        # NMFk.jl rule: largest k with robustness > cutoff. If none pass
+        # and strict=False, pick the k with maximum robustness.
+        passing = [r for r in results if r["robustness"] > silhouette_min]
+        if passing:
+            best = max(passing, key=lambda r: r["k"])
+        elif not strict:
+            best = max(results, key=lambda r: r["robustness"])
+        else:
+            # strict=True + nothing passes → pick max-robustness as a sane
+            # default rather than returning None (the per-species loop
+            # needs some W to stack). Log this as a degraded case.
+            best = max(results, key=lambda r: r["robustness"])
+            best["degraded"] = True
+    elif selection == "silhouette":
+        stable = [r for r in results if r["robustness"] >= silhouette_min]
+        if not stable:
+            stable = results
+        best = max(stable, key=lambda r: (r["mean_silhouette"], -r["mean_rel_error"]))
+    else:  # "rel_error": legacy — lowest error among stable
+        stable = [r for r in results if r["robustness"] >= silhouette_min]
+        if not stable:
+            stable = results
+        best = min(stable, key=lambda r: (r["mean_rel_error"], -r["robustness"]))
     best_k = best["k"]
     return best_k, best_W_per_k[best_k], {"results": results, "selected": best}
 
@@ -266,7 +304,8 @@ def cmd_build_dicts(cfg: dict):
     logger.info(
         f"Fitting {num_species} species (k range {pcfg['k_min']}..{pcfg['k_max']} "
         f"step {pcfg['k_step']}, {pcfg['n_runs_per_k']} runs/k, "
-        f"selection={pcfg.get('k_selection', 'rel_error')})"
+        f"selection={pcfg.get('k_selection', 'nmfk')}, "
+        f"cutoff={pcfg['silhouette_min']}, strict={pcfg.get('k_strict', True)})"
     )
     n_fallback = 0
     for i, sp in enumerate(species_list):
@@ -308,18 +347,23 @@ def cmd_build_dicts(cfg: dict):
             silhouette_min=pcfg["silhouette_min"],
             seed=pcfg.get("seed", 42) + i,
             algo=algo, use_gpu=use_gpu,
-            selection=pcfg.get("k_selection", "rel_error"),
+            selection=pcfg.get("k_selection", "nmfk"),
+            strict=pcfg.get("k_strict", True),
         )
         W_per_species[sp] = W_sp
         sel = diag.get("selected", {}) or {}
         rel_err = sel.get("mean_rel_error", float("nan"))
-        sil = sel.get("silhouette", float("nan"))
+        robustness = sel.get("robustness", float("nan"))
+        mean_sil = sel.get("mean_silhouette", float("nan"))
+        degraded = sel.get("degraded", False)
         species_info.append({
             "species": sp, "k_sp": best_k,
             "n_clips": int(V.shape[1] // T),
             "n_frames": int(V.shape[1]),
-            "silhouette": sil,
+            "robustness": robustness,
+            "mean_silhouette": mean_sil,
             "rel_error": rel_err,
+            "degraded": degraded,
             "fallback": False,
         })
 
@@ -328,10 +372,11 @@ def cmd_build_dicts(cfg: dict):
         done = i + 1
         remaining = num_species - done
         eta_min = (elapsed / done) * remaining / 60.0
+        tag = " [DEGRADED]" if degraded else ""
         logger.info(
             f"[{done:3d}/{num_species}] {sp:<12s} k={best_k:<3d} clips={V.shape[1] // T:<3d}  "
-            f"rel_err={rel_err:.3f} sil={sil:+.2f}  "
-            f"t={t_species:5.1f}s  elapsed={elapsed/60:5.1f}m  eta={eta_min:5.1f}m"
+            f"rob={robustness:+.2f} sil_mean={mean_sil:+.2f} rel_err={rel_err:.3f}  "
+            f"t={t_species:5.1f}s  elapsed={elapsed/60:5.1f}m  eta={eta_min:5.1f}m{tag}"
         )
 
     logger.info(
