@@ -122,14 +122,15 @@ stage_nmf_pc:
   # reconstruction-quality + activation-energy signals → 2 * num_species features.
   max_clips_per_species: 50      # cap clips per species for W_sp training
   min_clips_per_species: 4       # species with fewer clips fall back to shared W
-  k_min: 4
-  k_max: 24
-  k_step: 4
+  k_min: 16
+  k_max: 96
+  k_step: 16
   n_runs_per_k: 3                # fewer runs than global NMFk: many species, keep fast
   nmf_max_iter: 400
   perturb_std: 0.01
   algo: hals                     # pyNMFk GPU solver — "hals" (default), "halsvar", "mu", or "bpp"
-  silhouette_min: 0.5
+  silhouette_min: 0.3            # gate for "stable enough"; final pick is lowest rel_error among stable
+  k_selection: rel_error         # "rel_error" (prefer expressive, stable-enough W) or "silhouette" (legacy)
   project_batch_size: 2048       # segments per batched pinv projection
   feature_mode: recon_goodness   # per species: recon_err + neg_frac + energy + pos_energy → 4*num_species dim
   mel_floor_db: -80.0

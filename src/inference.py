@@ -189,7 +189,7 @@ class PantanalPredictor:
         1536-D global embedding is still prepended to the feature vector
         (matching build_features.py behavior).
 
-        nmf_feat: optional (2*num_species,) per-class NMF features appended
+        nmf_feat: optional (4*num_species,) per-class NMF features appended
         after the subcluster features (matches build_features.py layout).
         """
         # Project into SupCon space for prototype comparison
@@ -216,7 +216,7 @@ class PantanalPredictor:
         return np.concatenate(parts).astype(np.float32)
 
     def _compute_nmf_batch(self, mels: np.ndarray) -> np.ndarray | None:
-        """Compute (B, 2*num_species) NMF features for a batch, or None."""
+        """Compute (B, 4*num_species) NMF features for a batch, or None."""
         if (self.nmf_W_all is None or self.nmf_W_all_pinv is None
                 or self.nmf_boundaries is None):
             return None

@@ -1,13 +1,16 @@
 #!/bin/bash
 #SBATCH --job-name=build_features
-#SBATCH --partition=general
+#SBATCH --partition=l40s
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=128G
-#SBATCH --time=2:00:00
+#SBATCH --time=4:00:00
 #SBATCH --output=/users/admarkowitz/PantanalSpeciesMonitoring/outputs/logs/build_features_%j.log
 #SBATCH --error=/users/admarkowitz/PantanalSpeciesMonitoring/outputs/logs/build_features_%j.log
+
+# CPU-only job — no --gres=gpu. Using l40s partition for fast queue access
+# (GPU requesters often leave CPU idle on these nodes).
 
 # ── Project paths ──
 PROJECT_DIR="$HOME/PantanalSpeciesMonitoring"

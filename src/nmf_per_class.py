@@ -5,9 +5,12 @@ Pipeline:
      from the cached mels memmap, concatenate into a matrix V_sp, run NMFk
      (rank selection by silhouette stability) to learn W_sp of shape
      (n_mels, k_sp). k_sp is species-specific.
-  2. project: stack all W_sp into one big pinv matrix W_all_pinv of shape
-     (sum_k, n_mels). For every segment, compute pseudoinverse activations
-     H = W_all_pinv @ V_clip, then per species extract 4 scalars:
+  2. project: each species' W_sp gets its own pseudoinverse W_sp_pinv
+     computed independently (block-diagonal assembly — no inter-species
+     competition). Blocks are stacked into W_all_pinv of shape
+     (sum_k, n_mels), so H = W_all_pinv @ V still works at inference but
+     each row now depends only on its species' atoms. Per species extract
+     4 scalars:
        - recon_error:  ||V_clip - W_sp @ H_sp||^2 / ||V_clip||^2
        - neg_frac:     fraction of H_sp entries below 0 (pseudoinverse only)
        - energy:       ||H_sp||^2
@@ -23,6 +26,8 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import json
 import os
 import pickle
@@ -126,9 +131,12 @@ def _run_nmf_once(V: np.ndarray, k: int, max_iter: int,
     noise = perturb_std * V.mean() * rng.randn(*V.shape).astype(np.float32)
     V_pert = np.maximum(V + noise, 1e-10).astype(np.float32)
 
-    W, H, rel_err_pert = pynmfk_run_nmf(
-        V_pert, k=k, algo=algo, max_iter=max_iter, seed=seed, use_gpu=use_gpu,
-    )
+    # nmf-torch prints "Use GPU mode." + per-10-iter loss lines. Across
+    # 234 species × ~6 k-values × 3 runs that's ~60k lines of noise. Swallow.
+    with contextlib.redirect_stdout(io.StringIO()):
+        W, H, rel_err_pert = pynmfk_run_nmf(
+            V_pert, k=k, algo=algo, max_iter=max_iter, seed=seed, use_gpu=use_gpu,
+        )
     # Report reconstruction error against the ORIGINAL (unperturbed) V
     V_norm = float(np.linalg.norm(V, "fro")) + 1e-10
     err = float(np.linalg.norm(V - W @ H, "fro") / V_norm)
@@ -139,8 +147,17 @@ def _select_k_for_species(V: np.ndarray, k_min: int, k_max: int, k_step: int,
                            n_runs: int, max_iter: int, perturb_std: float,
                            silhouette_min: float, seed: int,
                            algo: str = "hals",
-                           use_gpu: bool = True) -> tuple[int, np.ndarray, dict]:
-    """NMFk rank selection for one species. Returns (best_k, best_W, diagnostics)."""
+                           use_gpu: bool = True,
+                           selection: str = "rel_error") -> tuple[int, np.ndarray, dict]:
+    """NMFk rank selection for one species. Returns (best_k, best_W, diagnostics).
+
+    selection:
+      "rel_error"  — lowest mean_rel_error among candidates with silhouette
+                     >= silhouette_min (fallback: all candidates). This lets
+                     dictionaries grow as large as is stable, avoiding the
+                     "silhouette-favors-small-k" trap.
+      "silhouette" — highest silhouette, tie-break by lower error (legacy).
+    """
     # Clamp k_max to what the matrix can support (k ≤ min(f, T))
     f, T = V.shape
     k_max = min(k_max, f - 1, T - 1)
@@ -184,11 +201,15 @@ def _select_k_for_species(V: np.ndarray, k_min: int, k_max: int, k_step: int,
                                 algo=algo, use_gpu=use_gpu)
         return W.shape[1], W, {"fallback": True, "results": []}
 
-    # Prefer: highest silhouette among stable (silhouette >= threshold), tie-break by lower error
+    # Candidates: prefer stable runs (silhouette >= threshold); else fall back to all
     stable = [r for r in results if r["silhouette"] >= silhouette_min]
     if not stable:
         stable = results
-    best = max(stable, key=lambda r: (r["silhouette"], -r["mean_rel_error"]))
+
+    if selection == "silhouette":
+        best = max(stable, key=lambda r: (r["silhouette"], -r["mean_rel_error"]))
+    else:  # "rel_error": pick lowest reconstruction error among stable candidates
+        best = min(stable, key=lambda r: (r["mean_rel_error"], -r["silhouette"]))
     best_k = best["k"]
     return best_k, best_W_per_k[best_k], {"results": results, "selected": best}
 
@@ -242,7 +263,14 @@ def cmd_build_dicts(cfg: dict):
     fallback_pool = []
 
     species_list = sorted(label_map.keys())
+    logger.info(
+        f"Fitting {num_species} species (k range {pcfg['k_min']}..{pcfg['k_max']} "
+        f"step {pcfg['k_step']}, {pcfg['n_runs_per_k']} runs/k, "
+        f"selection={pcfg.get('k_selection', 'rel_error')})"
+    )
+    n_fallback = 0
     for i, sp in enumerate(species_list):
+        t_sp = time.time()
         V = _gather_species_matrix(
             sp, segments, mels, written,
             max_clips=pcfg["max_clips_per_species"],
@@ -265,6 +293,11 @@ def cmd_build_dicts(cfg: dict):
                 "species": sp, "k_sp": 0, "n_clips": int(len(idxs)),
                 "fallback": True,
             })
+            n_fallback += 1
+            logger.info(
+                f"[{i+1:3d}/{num_species}] {sp:<12s} FALLBACK  clips={len(idxs):<3d}  "
+                f"(pooled → shared W)"
+            )
             continue
 
         best_k, W_sp, diag = _select_k_for_species(
@@ -275,22 +308,36 @@ def cmd_build_dicts(cfg: dict):
             silhouette_min=pcfg["silhouette_min"],
             seed=pcfg.get("seed", 42) + i,
             algo=algo, use_gpu=use_gpu,
+            selection=pcfg.get("k_selection", "rel_error"),
         )
         W_per_species[sp] = W_sp
+        sel = diag.get("selected", {}) or {}
+        rel_err = sel.get("mean_rel_error", float("nan"))
+        sil = sel.get("silhouette", float("nan"))
         species_info.append({
             "species": sp, "k_sp": best_k,
             "n_clips": int(V.shape[1] // T),
             "n_frames": int(V.shape[1]),
-            "silhouette": diag.get("selected", {}).get("silhouette"),
-            "rel_error": diag.get("selected", {}).get("mean_rel_error"),
+            "silhouette": sil,
+            "rel_error": rel_err,
             "fallback": False,
         })
-        if (i + 1) % 20 == 0 or i == len(species_list) - 1:
-            elapsed = time.time() - t0
-            logger.info(
-                f"  [{i+1}/{num_species}] {sp}: k={best_k} "
-                f"(clips={V.shape[1] // T}, elapsed={elapsed/60:.1f}min)"
-            )
+
+        t_species = time.time() - t_sp
+        elapsed = time.time() - t0
+        done = i + 1
+        remaining = num_species - done
+        eta_min = (elapsed / done) * remaining / 60.0
+        logger.info(
+            f"[{done:3d}/{num_species}] {sp:<12s} k={best_k:<3d} clips={V.shape[1] // T:<3d}  "
+            f"rel_err={rel_err:.3f} sil={sil:+.2f}  "
+            f"t={t_species:5.1f}s  elapsed={elapsed/60:5.1f}m  eta={eta_min:5.1f}m"
+        )
+
+    logger.info(
+        f"Per-species fitting done. real_dicts={num_species - n_fallback}, "
+        f"fallback={n_fallback}, total_time={(time.time() - t0)/60:.1f}m"
+    )
 
     # Build shared fallback W from pooled low-data species
     W_fallback = None
@@ -322,14 +369,22 @@ def cmd_build_dicts(cfg: dict):
     W_all = np.concatenate(W_blocks, axis=1).astype(np.float32)
     logger.info(f"W_all shape: {W_all.shape}, total k = {boundaries[-1]}")
 
-    # Precompute pseudoinverse W_all_pinv = (W^T W)^-1 W^T → shape (sum_k, n_mels)
-    # Use ridge-regularized solve for numerical stability.
-    sum_k = W_all.shape[1]
-    WtW = W_all.T @ W_all  # (sum_k, sum_k)
-    ridge = 1e-4 * np.trace(WtW) / max(sum_k, 1)
-    WtW += ridge * np.eye(sum_k, dtype=np.float32)
-    W_all_pinv = np.linalg.solve(WtW, W_all.T).astype(np.float32)  # (sum_k, n_mels)
-    logger.info(f"W_all_pinv shape: {W_all_pinv.shape}, ridge={ridge:.2e}")
+    # Per-species pseudoinverse: compute W_sp_pinv independently per species
+    # and stack. This removes the inter-species competition that the joint
+    # ridge-solve introduces: each species' H_sp is now the least-squares fit
+    # against ONLY its own dictionary, so a strong fit by species A can't
+    # suppress activation on species B. At inference the layout and shape
+    # are identical to the joint version — H = W_all_pinv @ V still works.
+    pinv_blocks = []
+    for W_sp in W_blocks:
+        k_sp = W_sp.shape[1]
+        WtW = W_sp.T @ W_sp  # (k_sp, k_sp)
+        ridge = 1e-4 * np.trace(WtW) / max(k_sp, 1)
+        WtW += ridge * np.eye(k_sp, dtype=np.float32)
+        W_sp_pinv = np.linalg.solve(WtW, W_sp.T).astype(np.float32)  # (k_sp, n_mels)
+        pinv_blocks.append(W_sp_pinv)
+    W_all_pinv = np.concatenate(pinv_blocks, axis=0).astype(np.float32)  # (sum_k, n_mels)
+    logger.info(f"W_all_pinv shape: {W_all_pinv.shape} (per-species pinv blocks)")
 
     # Save
     np.save(out_dir / "W_all.npy", W_all)
