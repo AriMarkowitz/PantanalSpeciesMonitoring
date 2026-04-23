@@ -23,10 +23,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import contextlib
-import io
 import json
-import sys
 import time
 from pathlib import Path
 
@@ -38,16 +35,7 @@ import torch
 from config import get_config
 from utils import setup_logging, build_label_map
 
-
-_PYNMFK_SRC = Path.home() / "pyNMFk" / "src"
-if _PYNMFK_SRC.exists() and str(_PYNMFK_SRC) not in sys.path:
-    sys.path.insert(0, str(_PYNMFK_SRC))
-
-from pynmfk.solvers import run_nmf as pynmfk_run_nmf  # noqa: E402
-from pynmfk.selection import (  # noqa: E402
-    compute_cluster_silhouettes,
-    compute_aic,
-)
+from pynmfk import run_nmfk, format_results_table  # installed via `pip install -e ~/pyNMFk`
 
 
 def _sample_stratified(segments: pd.DataFrame, written: np.ndarray,
@@ -70,96 +58,6 @@ def _sample_stratified(segments: pd.DataFrame, written: np.ndarray,
     if not sampled:
         raise RuntimeError("No strong_primary segments found — check segments.csv/written.")
     return np.sort(np.concatenate(sampled))
-
-
-def _run_nmf_once(V: np.ndarray, k: int, max_iter: int,
-                  seed: int, perturb_std: float,
-                  algo: str = "hals", use_gpu: bool = True):
-    """Single perturbed NMF fit. Returns (W, H, rel_error_vs_clean_V)."""
-    rng = np.random.RandomState(seed)
-    noise = perturb_std * V.mean() * rng.randn(*V.shape).astype(np.float32)
-    V_pert = np.maximum(V + noise, 1e-10).astype(np.float32)
-
-    with contextlib.redirect_stdout(io.StringIO()):
-        W, H, _ = pynmfk_run_nmf(
-            V_pert, k=k, algo=algo, max_iter=max_iter, seed=seed, use_gpu=use_gpu,
-        )
-    V_norm = float(np.linalg.norm(V, "fro")) + 1e-10
-    err = float(np.linalg.norm(V - W @ H, "fro") / V_norm)
-    return W.astype(np.float32), H.astype(np.float32), err
-
-
-def _select_k_nmfk(V: np.ndarray, k_min: int, k_max: int, k_step: int,
-                    n_runs: int, max_iter: int, perturb_std: float,
-                    cutoff: float, seed: int,
-                    algo: str = "hals", use_gpu: bool = True,
-                    strict: bool = True, logger=None):
-    """Canonical NMFk.jl selection: largest k with robustness > cutoff.
-
-    Returns (best_k, best_W, diagnostics).
-    """
-    f, T = V.shape
-    k_max = min(k_max, f - 1, T - 1)
-    ks = list(range(k_min, k_max + 1, k_step))
-    if logger:
-        logger.info(f"Sweep k ∈ {ks}, {n_runs} runs each")
-
-    results = []
-    best_W_per_k = {}
-    for k in ks:
-        t_k = time.time()
-        W_runs, errs, best_err, best_W, best_H = [], [], float("inf"), None, None
-        for r in range(n_runs):
-            try:
-                W, H, err = _run_nmf_once(
-                    V, k, max_iter=max_iter,
-                    seed=seed + r, perturb_std=perturb_std,
-                    algo=algo, use_gpu=use_gpu,
-                )
-            except Exception as e:
-                if logger:
-                    logger.warning(f"  k={k} run={r}: {e}")
-                continue
-            W_runs.append(W)
-            errs.append(err)
-            if err < best_err:
-                best_err, best_W, best_H = err, W, H
-        if not W_runs or best_W is None:
-            continue
-        cluster_sils = compute_cluster_silhouettes(W_runs)
-        robustness = float(cluster_sils.min())
-        mean_sil = float(cluster_sils.mean())
-        aic = compute_aic(V, best_W, best_H, k)
-        results.append({
-            "k": k, "robustness": robustness, "mean_silhouette": mean_sil,
-            "mean_rel_error": float(np.mean(errs)),
-            "std_rel_error": float(np.std(errs)),
-            "aic": float(aic),
-        })
-        best_W_per_k[k] = best_W
-        if logger:
-            logger.info(
-                f"  k={k:3d}  rob={robustness:+.3f}  sil_mean={mean_sil:+.3f}  "
-                f"rel_err={np.mean(errs):.4f}  aic={aic:.1f}  "
-                f"t={time.time() - t_k:.1f}s"
-            )
-
-    if not results:
-        raise RuntimeError("No successful NMF fits across candidate ks")
-
-    passing = [r for r in results if r["robustness"] > cutoff]
-    if passing:
-        best = max(passing, key=lambda r: r["k"])
-        method = "nmfk_largest_stable"
-    elif not strict:
-        best = max(results, key=lambda r: r["robustness"])
-        method = "nmfk_max_robustness_fallback"
-    else:
-        best = max(results, key=lambda r: r["robustness"])
-        method = "nmfk_degraded"
-    return best["k"], best_W_per_k[best["k"]], {
-        "results": results, "selected": best, "method": method,
-    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -206,18 +104,21 @@ def cmd_build(cfg: dict):
     # NMF expects V of shape (features, samples). Here features = D, samples = N.
     V = embs_nn.T.copy()                              # (D, N_sample)
 
-    best_k, W, diag = _select_k_nmfk(
+    t0 = time.time()
+    W, result = run_nmfk(
         V,
         k_min=gcfg["k_min"], k_max=gcfg["k_max"], k_step=gcfg["k_step"],
         n_runs=gcfg["n_runs_per_k"], max_iter=gcfg["nmf_max_iter"],
-        perturb_std=gcfg["perturb_std"], cutoff=gcfg["silhouette_min"],
+        perturb_std=gcfg["perturb_std"], silhouette_min=gcfg["silhouette_min"],
         seed=gcfg.get("seed", 42), algo=algo, use_gpu=use_gpu,
-        strict=gcfg.get("strict", True), logger=logger,
+        selection="nmfk", strict=gcfg.get("strict", True),
     )
+    logger.info(f"pyNMFk sweep finished in {(time.time() - t0)/60:.1f}m")
+    logger.info("k_sweep:\n" + format_results_table(result.results))
     logger.info(
-        f"Selected k={best_k} via {diag['method']} "
-        f"(robustness={diag['selected']['robustness']:+.3f}, "
-        f"rel_err={diag['selected']['mean_rel_error']:.4f})"
+        f"Selected k={result.selected_k} via {result.selected_method} "
+        f"(robustness={result.selected_robustness:+.3f}, "
+        f"rel_err={result.selected_error:.4f})"
     )
 
     # Precompute pseudoinverse W_pinv for downstream projection
@@ -229,16 +130,21 @@ def cmd_build(cfg: dict):
     np.save(out_dir / "W.npy", W)
     np.save(out_dir / "W_pinv.npy", W_pinv)
     np.save(out_dir / "sample_indices.npy", sample_idx.astype(np.int64))
-    pd.DataFrame(diag["results"]).to_csv(out_dir / "k_sweep.csv", index=False)
+    pd.DataFrame([r.__dict__ for r in result.results]).to_csv(
+        out_dir / "k_sweep.csv", index=False
+    )
     with open(out_dir / "build_info.json", "w") as f:
         json.dump({
             "embeddings_source": emb_source,
             "embeddings_path": emb_path,
             "D": int(D),
             "n_sample": int(len(sample_idx)),
-            "selected_k": int(best_k),
-            "method": diag["method"],
-            "selected": diag["selected"],
+            "selected_k": int(result.selected_k),
+            "method": result.selected_method,
+            "robustness": result.selected_robustness,
+            "silhouette": result.selected_silhouette,
+            "aic": result.selected_aic,
+            "rel_error": result.selected_error,
         }, f, indent=2)
     logger.info(f"Saved → {out_dir}: W{W.shape}, W_pinv{W_pinv.shape}, k_sweep.csv, build_info.json")
 
