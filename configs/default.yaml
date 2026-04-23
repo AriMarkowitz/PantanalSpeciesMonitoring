@@ -65,6 +65,20 @@ stage3:
   similarity_metric: cosine    # "cosine" (default, better for Perch) or "euclidean"
   temperature: 0.1             # softmax temperature — lower = sharper assignment
 
+probe:
+  # Prototypical probing head (Bird-MAE paper, arXiv:2504.12880).
+  # Reads spatial embeddings (N, L, D) from student_embeddings.h5,
+  # trains J learned prototypes per species end-to-end with BCE + orthogonality.
+  prototypes_per_class: 10
+  lr: 1.0e-3
+  weight_decay: 1.0e-4
+  ortho_weight: 0.1
+  batch_size: 256
+  epochs: 30
+  num_workers: 0
+  preload: true                # hold spatial_embeddings in RAM (~11 GB) during training
+  fold: 0
+
 stage4:
   # Regularization tuned for the no-Perch-logits feature set (3538D).
   # Without logits, the model overfits fast — best epoch was 2/50 on the

@@ -1,6 +1,6 @@
 """
-BirdCLEF 2026 — Kaggle Inference Notebook (Pantanal Pipeline)
-Student EfficientNet-B1 → SupCon-projected prototypes → MLP classifier.
+BirdCLEF 2026 — Kaggle Inference Notebook (Pantanal Pipeline, probing branch).
+Student EfficientNet-B1 → spatial embeddings → prototypical probing head.
 
 Constraints: CPU-only, no internet, 90-minute limit.
 """
@@ -8,7 +8,6 @@ Constraints: CPU-only, no internet, 90-minute limit.
 import gc
 import glob
 import os
-import pickle
 import time
 import warnings
 warnings.filterwarnings("ignore")
@@ -21,8 +20,6 @@ import torch.nn.functional as F
 import soundfile as sf
 import librosa
 import yaml
-from scipy.special import softmax
-from scipy.stats import entropy
 
 # ── CPU optimization ────────────────────────────────────────────────────────
 torch.set_num_threads(4)
@@ -58,12 +55,10 @@ print(f"Artifacts:        {ARTIFACTS}")
 with open(os.path.join(ARTIFACTS, "config.yaml")) as f:
     CFG = yaml.safe_load(f)
 
-SAMPLE_RATE = CFG["data"]["sample_rate"]          # 32000
-SEGMENT_SECONDS = CFG["data"]["segment_duration"]  # 5.0
+SAMPLE_RATE = CFG["data"]["sample_rate"]
+SEGMENT_SECONDS = CFG["data"]["segment_duration"]
 SEGMENT_SAMPLES = int(SAMPLE_RATE * SEGMENT_SECONDS)
 MEL_CFG = CFG.get("student_mel", {})
-TEMPERATURE = CFG["stage3"].get("temperature", 0.1)
-METRIC = CFG["stage3"].get("similarity_metric", "cosine")
 BATCH_SIZE = 8
 
 
@@ -78,7 +73,6 @@ label_map, sorted_labels = build_label_map(TAXONOMY_PATH)
 NUM_CLASSES = len(label_map)
 print(f"Classes: {NUM_CLASSES}")
 
-# Read submission column order and build index mapping
 sample_sub = pd.read_csv(SAMPLE_SUB_PATH, nrows=0)
 sub_columns = [c for c in sample_sub.columns if c != "row_id"]
 assert len(sub_columns) == NUM_CLASSES, (
@@ -89,6 +83,7 @@ col_indices = np.array([label_map[c] for c in sub_columns])
 
 # ── Mel spectrogram ─────────────────────────────────────────────────────────
 _mel_basis_cache = {}
+
 
 def _build_mel_basis(sr, mel_cfg):
     n_mels = mel_cfg.get("n_mels", 128)
@@ -108,7 +103,6 @@ def _build_mel_basis(sr, mel_cfg):
 
 
 def wav_to_mel_np(wav, sr, mel_cfg):
-    """~3ms per 5s segment. Pure numpy, no torch dependency."""
     key = (sr, tuple(sorted(mel_cfg.items())))
     if key not in _mel_basis_cache:
         _mel_basis_cache[key] = _build_mel_basis(sr, mel_cfg)
@@ -177,124 +171,49 @@ class StudentEmbedder(nn.Module):
         return global_emb, spatial_emb
 
 
-# ── MLP Classifier ──────────────────────────────────────────────────────────
-class MotifClassifier(nn.Module):
-    def __init__(self, input_dim, num_classes, hidden_dims=(512, 256), dropout=0.0):
+# ── Prototypical Probing Head ───────────────────────────────────────────────
+class PrototypicalHead(nn.Module):
+    def __init__(self, embed_dim, num_classes, prototypes_per_class):
         super().__init__()
-        layers = []
-        prev_dim = input_dim
-        for h_dim in hidden_dims:
-            layers.extend([
-                nn.Linear(prev_dim, h_dim),
-                nn.BatchNorm1d(h_dim),
-                nn.ReLU(inplace=True),
-                nn.Dropout(dropout),
-            ])
-            prev_dim = h_dim
-        self.backbone = nn.Sequential(*layers)
-        self.head = nn.Linear(prev_dim, num_classes)
+        self.prototypes = nn.Parameter(
+            torch.randn(num_classes, prototypes_per_class, embed_dim) * 0.02
+        )
+        self.raw_weights = nn.Parameter(
+            torch.full((num_classes, prototypes_per_class), -2.0)
+        )
+        self.bias = nn.Parameter(torch.zeros(num_classes))
 
-    def forward(self, x):
-        return self.head(self.backbone(x))
-
-
-# ── Feature computation ─────────────────────────────────────────────────────
-def _l2_normalize(x, axis=-1, eps=1e-8):
-    norms = np.linalg.norm(x, axis=axis, keepdims=True)
-    return x / np.maximum(norms, eps)
+    def forward(self, spatial):
+        z = F.normalize(spatial, dim=-1)
+        p = F.normalize(self.prototypes, dim=-1)
+        sim = torch.einsum("bld,cjd->blcj", z, p)
+        pooled = sim.max(dim=1).values
+        w = F.softplus(self.raw_weights)
+        return (pooled * w.unsqueeze(0)).sum(dim=-1) + self.bias
 
 
-def compute_global_motif_features(spatial_emb, prototypes,
-                                   temperature=0.1, metric="cosine"):
-    local = spatial_emb.reshape(-1, spatial_emb.shape[-1])
-    K = prototypes.shape[0]
-    if metric == "cosine":
-        local_n = _l2_normalize(local, axis=1)
-        proto_n = _l2_normalize(prototypes, axis=1)
-        logits = (local_n @ proto_n.T) / temperature
-    else:
-        z_sq = np.sum(local ** 2, axis=1, keepdims=True)
-        p_sq = np.sum(prototypes ** 2, axis=1, keepdims=True).T
-        logits = -(z_sq + p_sq - 2.0 * local @ prototypes.T) / temperature
-
-    weights = softmax(logits, axis=1)
-    hist = weights.sum(axis=0)
-    max_act = weights.max(axis=0)
-    spread = weights.std(axis=0)
-    avg_ent = np.mean([entropy(w) for w in weights])
-    max_ent = np.log(K) if K > 1 else 1.0
-    noise = avg_ent / max_ent
-    return hist, max_act, spread, noise
-
-
-def compute_species_subcluster_features(global_emb, species_gmms, label_map):
-    num_species = len(label_map)
-    best_match = np.full(num_species, -100.0, dtype=np.float32)
-    sub_entropy = np.zeros(num_species, dtype=np.float32)
-    emb_2d = global_emb.reshape(1, -1)
-    for sp, idx in label_map.items():
-        if sp not in species_gmms:
-            continue
-        model = species_gmms[sp]
-        if model["n_components"] == 0 or "gmm" not in model or model["gmm"] is None:
-            continue
-        try:
-            reduced = model["pca"].transform(emb_2d)
-            posteriors = model["gmm"].predict_proba(reduced)[0]
-            best_match[idx] = posteriors.max()
-            sub_entropy[idx] = entropy(posteriors + 1e-10)
-        except Exception:
-            continue
-    return best_match, sub_entropy
-
-
-# ── Load all components ─────────────────────────────────────────────────────
+# ── Load components ─────────────────────────────────────────────────────────
 t_load = time.time()
 
-print("Loading student model...")
+print("Loading student...")
 student = StudentEmbedder.from_pretrained()
 ckpt = torch.load(os.path.join(ARTIFACTS, "student_best.pt"),
                    map_location="cpu", weights_only=False)
 student.load_state_dict(ckpt["model_state_dict"])
 student.eval()
 del ckpt; gc.collect()
-print(f"  Student loaded")
 
-print("Loading prototypes and GMMs...")
-proto_data = np.load(os.path.join(ARTIFACTS, "global_prototypes.npz"))
-prototypes = proto_data["prototypes"].astype(np.float32)
-W = np.load(os.path.join(ARTIFACTS, "supcon_W.npy"))  # (proj_dim, 1536)
-print(f"  Prototypes: {prototypes.shape}, SupCon projection: 1536 -> {W.shape[0]}")
-
-
-def project_fn(X):
-    """Project (..., 1536) -> (..., proj_dim) with L2 normalization."""
-    orig_shape = X.shape[:-1]
-    flat = X.reshape(-1, X.shape[-1])
-    z = flat @ W.T
-    z = z / np.maximum(np.linalg.norm(z, axis=1, keepdims=True), 1e-8)
-    return z.reshape(*orig_shape, W.shape[0])
-
-
-with open(os.path.join(ARTIFACTS, "species_gmms.pkl"), "rb") as f:
-    species_gmms = pickle.load(f)
-
-print("Loading classifier...")
-cls_ckpt = torch.load(os.path.join(ARTIFACTS, "classifier_best.pt"),
-                       map_location="cpu", weights_only=False)
-feat_dim = cls_ckpt["feat_dim"]
-cls_cfg = cls_ckpt.get("config", {})
-classifier = MotifClassifier(
-    input_dim=feat_dim,
-    num_classes=cls_ckpt["num_classes"],
-    hidden_dims=cls_cfg.get("hidden_dims", [512, 256]),
-    dropout=0.0,
-)
-classifier.load_state_dict(cls_ckpt["model_state_dict"])
-classifier.eval()
-del cls_ckpt; gc.collect()
-print(f"  Classifier: {feat_dim}D -> {NUM_CLASSES} classes")
-print(f"All models loaded in {time.time() - t_load:.1f}s")
+print("Loading probe...")
+probe_ckpt = torch.load(os.path.join(ARTIFACTS, "proto_probe_best.pt"),
+                         map_location="cpu", weights_only=False)
+pc = probe_ckpt["config"]
+head = PrototypicalHead(embed_dim=int(pc["D"]),
+                         num_classes=int(pc["num_classes"]),
+                         prototypes_per_class=int(pc["J"]))
+head.load_state_dict(probe_ckpt["model_state_dict"])
+head.eval()
+del probe_ckpt; gc.collect()
+print(f"Loaded in {time.time() - t_load:.1f}s")
 
 
 # ── Audio helpers ───────────────────────────────────────────────────────────
@@ -322,46 +241,14 @@ def segment_audio(audio):
 
 
 # ── Inference ───────────────────────────────────────────────────────────────
-def embed_batch(waveforms):
-    """Batch of waveforms (B, samples) -> global (B, 1536), spatial (B, 5, 1536), mels (B, n_mels, T)."""
-    mels_np = np.stack([wav_to_mel_np(w, SAMPLE_RATE, MEL_CFG) for w in waveforms])  # (B, n_mels, T)
-    mels_t = torch.from_numpy(mels_np).unsqueeze(1).float()  # (B, 1, n_mels, T)
-    g, s = student(mels_t, normalize=True)
-    return g.numpy(), s.numpy(), mels_np
+def predict_batch(waveforms):
+    mels_np = np.stack([wav_to_mel_np(w, SAMPLE_RATE, MEL_CFG) for w in waveforms])
+    mels_t = torch.from_numpy(mels_np).unsqueeze(1).float()
+    _g, spatial = student(mels_t, normalize=True)
+    logits = head(spatial)
+    return torch.sigmoid(logits).numpy()
 
 
-def build_features_batch(global_embs, spatial_embs, mels_batch=None):
-    """Build feature vectors for a batch of segments."""
-    features = []
-    for j in range(len(global_embs)):
-        g = global_embs[j]
-        s = spatial_embs[j]
-
-        s_proj = project_fn(s)
-        g_proj = project_fn(g.reshape(1, -1))[0]
-
-        hist, max_act, spread, noise = compute_global_motif_features(
-            s_proj, prototypes, temperature=TEMPERATURE, metric=METRIC)
-        best_match, sub_ent = compute_species_subcluster_features(
-            g_proj, species_gmms, label_map)
-
-        parts = [g, hist, max_act, spread, [noise], best_match, sub_ent]
-        feat = np.concatenate(parts).astype(np.float32)
-        features.append(feat)
-    return np.stack(features)
-
-
-def classify_features(features):
-    """(N, D) feature matrix -> (N, C) probabilities."""
-    feat_t = torch.from_numpy(features)
-    all_probs = []
-    for start in range(0, len(feat_t), 512):
-        logits = classifier(feat_t[start:start + 512])
-        all_probs.append(torch.sigmoid(logits).numpy())
-    return np.concatenate(all_probs, axis=0)
-
-
-# ── Main loop ──────────────────────────────────────────────────────────────
 def main():
     t0 = time.time()
 
@@ -371,7 +258,7 @@ def main():
         + glob.glob(os.path.join(TEST_SOUNDSCAPES, "*.mp3"))
         + glob.glob(os.path.join(TEST_SOUNDSCAPES, "*.flac"))
     )
-    print(f"\nFound {len(test_files)} test soundscapes")
+    print(f"Found {len(test_files)} test soundscapes")
 
     all_row_ids = []
     all_probs = []
@@ -390,21 +277,14 @@ def main():
             continue
 
         n_segments = len(segments)
-        # row_id = filename_without_ext + "_" + end_second
         row_ids = [f"{fname_stem}_{(i + 1) * int(SEGMENT_SECONDS)}"
                    for i in range(n_segments)]
 
         for batch_start in range(0, n_segments, BATCH_SIZE):
             batch = segments[batch_start:batch_start + BATCH_SIZE]
-
-            global_embs, spatial_embs, mels_batch = embed_batch(batch)
-            features = build_features_batch(global_embs, spatial_embs, mels_batch)
-            probs = classify_features(features)
-
-            # Reorder columns to match submission format
+            probs = predict_batch(batch)
             all_probs.append(probs[:, col_indices])
-            all_row_ids.extend(
-                row_ids[batch_start:batch_start + len(batch)])
+            all_row_ids.extend(row_ids[batch_start:batch_start + len(batch)])
 
         if (file_idx + 1) % 50 == 0:
             print(f"  Processed {file_idx + 1}/{len(test_files)} "
