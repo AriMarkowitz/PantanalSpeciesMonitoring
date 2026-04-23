@@ -21,6 +21,7 @@ outputs:
   checkpoints_dir: outputs/checkpoints
   pseudo_labels_dir: outputs/pseudo_labels
   nmf_dir: outputs/nmf_per_class
+  nmf_global_dir: outputs/nmf_global
   logs_dir: outputs/logs
 
 stage0:
@@ -115,23 +116,21 @@ stage4b:
   pseudo_weight: 0.5
   use_perch_logits_round1: true
 
-stage_nmf_pc:
-  # Per-species NMFk dictionaries. Each species gets its own W_sp (128 mels, k_sp)
-  # trained on its strong_primary segments. At inference we use pseudoinverse
-  # projection (one matmul per stacked W_pinv) to extract per-species
-  # reconstruction-quality + activation-energy signals → 2 * num_species features.
-  max_clips_per_species: 50      # cap clips per species for W_sp training
-  min_clips_per_species: 4       # species with fewer clips fall back to shared W
-  k_min: 16
-  k_max: 96
-  k_step: 16
-  n_runs_per_k: 3                # fewer runs than global NMFk: many species, keep fast
-  nmf_max_iter: 400
+stage_nmf_global:
+  # NMFk on a stratified sample of student embeddings → a global motif
+  # dictionary W (D, k). Downstream features are H = W_pinv @ embedding.
+  # Hypothesis: embeddings already organize by species, so motif activations
+  # should reflect sub-call structure rather than generic spectrogram primitives.
+  embeddings: student            # "student" or "perch" — fit where we'll infer
+  per_species_sample: 150        # stratified sample; 234 × 150 ≈ 35k segments
+  k_min: 32
+  k_max: 256
+  k_step: 32                     # tests k ∈ {32, 64, 96, 128, 160, 192, 224, 256}
+  n_runs_per_k: 5                # one fit per sample (not per species) so we can afford more runs
+  nmf_max_iter: 600
   perturb_std: 0.01
-  algo: hals                     # pyNMFk GPU solver — "hals" (default), "halsvar", "mu", or "bpp"
-  silhouette_min: 0.5            # NMFk.jl cutoff: robustness = min(cluster silhouettes) must exceed this
-  k_selection: nmfk              # "nmfk" = canonical NMFk.jl rule (largest k with robustness > cutoff)
-  k_strict: true                 # if no k passes cutoff, fall back to max-robustness k (NMFk.jl: strict=false behavior)
-  project_batch_size: 128        # segments per batched pinv projection (sum_k can be >20k → H_flat scales with sum_k × B × T, keep small)
-  feature_mode: recon_goodness   # per species: recon_err + neg_frac + energy + pos_energy → 4*num_species dim
-  mel_floor_db: -80.0
+  algo: hals
+  silhouette_min: 0.5            # NMFk.jl default cutoff
+  strict: true                   # if none pass, keep max-robustness k (tagged as degraded)
+  project_batch_size: 4096       # embedding-space projection is tiny; bigger batches fine
+  seed: 42

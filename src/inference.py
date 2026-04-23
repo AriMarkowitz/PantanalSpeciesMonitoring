@@ -41,7 +41,6 @@ from build_features import (
     compute_global_motif_features,
     compute_species_subcluster_features,
 )
-from nmf_per_class import project_segments_to_features
 
 
 class PantanalPredictor:
@@ -59,10 +58,7 @@ class PantanalPredictor:
                  label_map: dict,
                  cfg: dict,
                  device: torch.device,
-                 project_fn=None,
-                 nmf_W_all: np.ndarray | None = None,
-                 nmf_W_all_pinv: np.ndarray | None = None,
-                 nmf_boundaries: np.ndarray | None = None):
+                 project_fn=None):
         self.student = student.to(device).eval()
         self.prototypes = prototypes          # (K, proj_dim) float32
         self.species_gmms = species_gmms
@@ -73,11 +69,6 @@ class PantanalPredictor:
         self.device = device
         self.num_classes = len(label_map)
         self.project_fn = project_fn
-
-        # Optional per-class NMF dictionaries
-        self.nmf_W_all = nmf_W_all
-        self.nmf_W_all_pinv = nmf_W_all_pinv
-        self.nmf_boundaries = nmf_boundaries
 
         self.seg_dur = cfg["data"]["segment_duration"]
         self.sr = cfg["data"]["sample_rate"]
@@ -138,24 +129,8 @@ class PantanalPredictor:
         )
         classifier.load_state_dict(ckpt["model_state_dict"])
 
-        # Optional per-class NMF dictionaries (stage_nmf_pc)
-        nmf_W_all = nmf_W_all_pinv = nmf_boundaries = None
-        nmf_dir_cfg = cfg["outputs"].get("nmf_dir", "")
-        nmf_candidates = [Path(nmf_dir_cfg)] if nmf_dir_cfg else []
-        # Also look next to the classifier checkpoint (packaged artifacts)
-        nmf_candidates.append(Path(classifier_ckpt).parent)
-        for nmf_dir in nmf_candidates:
-            if (nmf_dir / "W_all_pinv.npy").exists():
-                nmf_W_all_pinv = np.load(nmf_dir / "W_all_pinv.npy")
-                nmf_boundaries = np.load(nmf_dir / "species_boundaries.npy")
-                if (nmf_dir / "W_all.npy").exists():
-                    nmf_W_all = np.load(nmf_dir / "W_all.npy")
-                break
-
         return cls(student, prototypes, species_gmms, classifier,
-                   label_map, cfg, dev, project_fn=project_fn,
-                   nmf_W_all=nmf_W_all, nmf_W_all_pinv=nmf_W_all_pinv,
-                   nmf_boundaries=nmf_boundaries)
+                   label_map, cfg, dev, project_fn=project_fn)
 
     # ── Core embedding + feature computation ────────────────────────────────
 
@@ -180,19 +155,14 @@ class PantanalPredictor:
         return g.cpu().numpy(), s.cpu().numpy(), mels_np
 
     def _build_feature(self, global_emb: np.ndarray,
-                        spatial_emb: np.ndarray,
-                        nmf_feat: np.ndarray | None = None) -> np.ndarray:
+                        spatial_emb: np.ndarray) -> np.ndarray:
         """Build feature vector for one segment.
 
         If SupCon projection is available, project embeddings into the
         prototype space before computing motif/GMM features. The raw
         1536-D global embedding is still prepended to the feature vector
         (matching build_features.py behavior).
-
-        nmf_feat: optional (4*num_species,) per-class NMF features appended
-        after the subcluster features (matches build_features.py layout).
         """
-        # Project into SupCon space for prototype comparison
         if self.project_fn is not None:
             spatial_proj = self.project_fn(spatial_emb)
             global_proj = self.project_fn(global_emb.reshape(1, -1))[0]
@@ -211,19 +181,7 @@ class PantanalPredictor:
 
         parts = [global_emb, hist, max_act, spread, np.array([noise]),
                  best_match, sub_ent]
-        if nmf_feat is not None:
-            parts.append(nmf_feat)
         return np.concatenate(parts).astype(np.float32)
-
-    def _compute_nmf_batch(self, mels: np.ndarray) -> np.ndarray | None:
-        """Compute (B, 4*num_species) NMF features for a batch, or None."""
-        if (self.nmf_W_all is None or self.nmf_W_all_pinv is None
-                or self.nmf_boundaries is None):
-            return None
-        mels_nn = np.maximum(mels.astype(np.float32), 0.0)
-        return project_segments_to_features(
-            mels_nn, self.nmf_W_all, self.nmf_W_all_pinv, self.nmf_boundaries,
-        )
 
     @torch.no_grad()
     def _classify_features(self, features: np.ndarray) -> np.ndarray:
@@ -278,14 +236,10 @@ class PantanalPredictor:
             starts_batch = [b[0] for b in batch]
             wavs_batch = [b[1] for b in batch]
 
-            global_embs, spatial_embs, mels_batch = self._embed_batch(wavs_batch)
-            nmf_batch = self._compute_nmf_batch(mels_batch)
+            global_embs, spatial_embs, _mels = self._embed_batch(wavs_batch)
 
             features = np.stack([
-                self._build_feature(
-                    global_embs[j], spatial_embs[j],
-                    nmf_feat=None if nmf_batch is None else nmf_batch[j],
-                )
+                self._build_feature(global_embs[j], spatial_embs[j])
                 for j in range(len(wavs_batch))
             ])
 
