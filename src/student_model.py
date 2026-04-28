@@ -37,23 +37,38 @@ class StudentEmbedder(nn.Module):
 
     def __init__(self, backbone: nn.Module, backbone_hidden: int = 1280,
                  embed_dim: int = PERCH_EMBED_DIM,
-                 spatial_h: int = SPATIAL_H, spatial_w: int = SPATIAL_W):
+                 spatial_h: int = SPATIAL_H, spatial_w: int = SPATIAL_W,
+                 hidden_mlp: int = 2048):
         super().__init__()
         self.backbone = backbone
         self.spatial_h = spatial_h
         self.spatial_w = spatial_w
 
-        # Global head: pool feature map → 1536-D
+        # Global head: pool → 2-layer MLP → embed_dim
+        # Prior version was a single Linear(1280, 1536); the student plateaued
+        # at cos=0.92 against a 0.93 target. A small MLP gives the head
+        # enough capacity to fit Perch's non-linear output structure.
         self.global_head = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
             nn.Flatten(),
-            nn.Linear(backbone_hidden, embed_dim),
+            nn.Linear(backbone_hidden, hidden_mlp),
+            nn.GELU(),
+            nn.LayerNorm(hidden_mlp),
+            nn.Linear(hidden_mlp, embed_dim),
         )
 
-        # Spatial head: pool to (5,3) grid → linear per cell
-        # Implemented as a conv to share computation
+        # Spatial head: pool to (spatial_h, spatial_w) → MLP per cell.
         self.spatial_pool = nn.AdaptiveAvgPool2d((spatial_h, spatial_w))
-        self.spatial_proj = nn.Linear(backbone_hidden, embed_dim)
+        self.spatial_proj = nn.Sequential(
+            nn.Linear(backbone_hidden, hidden_mlp),
+            nn.GELU(),
+            nn.LayerNorm(hidden_mlp),
+            nn.Linear(hidden_mlp, embed_dim),
+        )
+
+        # Optional logit head for distilling Perch's top-k logits.
+        # Built lazily on first use; `top_k` decided by train_student config.
+        self.logit_head: nn.Module | None = None
 
     @classmethod
     def from_pretrained(cls, backbone_name: str = BIRDSET_BACKBONE,
@@ -94,20 +109,33 @@ class StudentEmbedder(nn.Module):
         return global_emb, spatial_emb
 
     def forward(self, mel: torch.Tensor,
-                normalize: bool = True) -> tuple[torch.Tensor, torch.Tensor]:
+                normalize: bool = True,
+                return_logits: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
         """Forward pass with optional L2 normalization.
 
         Returns:
             global_emb: (B, embed_dim)   — L2 normalized if normalize=True
             spatial_emb: (B, H, embed_dim) — L2 normalized per frame
+            (logits):   (B, top_k)        — only when return_logits=True
         """
         global_emb, spatial_emb = self.encode(mel)
 
         if normalize:
-            global_emb = F.normalize(global_emb, dim=-1)
-            spatial_emb = F.normalize(spatial_emb, dim=-1)
+            g_out = F.normalize(global_emb, dim=-1)
+            s_out = F.normalize(spatial_emb, dim=-1)
+        else:
+            g_out, s_out = global_emb, spatial_emb
 
-        return global_emb, spatial_emb
+        if return_logits and self.logit_head is not None:
+            logits = self.logit_head(global_emb)
+            return g_out, s_out, logits
+        return g_out, s_out
+
+    def attach_logit_head(self, top_k: int) -> None:
+        """Add a linear logit head on top of the global embedding for
+        distilling Perch's top-k logits. Call this once, after
+        from_pretrained(), before training."""
+        self.logit_head = nn.Linear(self.global_head[-1].out_features, top_k)
 
 
 class DistillationLoss(nn.Module):

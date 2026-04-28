@@ -25,6 +25,7 @@ import h5py
 from config import get_config
 from student_model import StudentEmbedder, DistillationLoss
 from utils import setup_logging, load_audio_segment
+from augment import spec_augment, mixup_pair
 
 
 # ── Dataset ──────────────────────────────────────────────────────────────────
@@ -46,7 +47,20 @@ class DistillDataset(Dataset):
     """
 
     def __init__(self, segments_csv: str, embeddings_h5: str, cfg: dict,
-                 fold: int = 0, split: str = "train", n_folds: int = 5):
+                 fold: int = 0, split: str = "train", n_folds: int = 5,
+                 augment: bool = False,
+                 noise_segment_meta: dict | None = None,
+                 live_mels: bool = False):
+        """
+        Args:
+            live_mels: if True, decode audio + compute mels per __getitem__
+                (slower but avoids the ~46GB mel memmap on disk). DataLoader
+                workers parallelise the decode so GPU stays fed.
+            noise_segment_meta: optional {"source_files": np.ndarray,
+                "start_secs": np.ndarray, "end_secs": np.ndarray} for
+                live noise overlay. Ignored if live_mels=False — in cached
+                mode, callers should pass `noise_mel_indices` instead.
+        """
         import pandas as pd
         from cache_mels import get_mel_shape
 
@@ -55,6 +69,13 @@ class DistillDataset(Dataset):
         self.seg_dur = cfg["data"]["segment_duration"]
         self.top_k = cfg["stage1"]["top_k_logits"]
         self.mel_cfg = cfg.get("student_mel", {})
+        self.augment = augment
+        self.live_mels = live_mels
+        # Two parallel paths for noise overlay:
+        #   live_mels=True  → noise_segment_meta (file paths + offsets)
+        #   live_mels=False → noise_mel_indices (rows in the mels memmap)
+        self.noise_segment_meta = noise_segment_meta
+        self.noise_mel_indices = (noise_segment_meta or {}).get("indices")
 
         # Load teacher embeddings into RAM (fork-safe via COW)
         with h5py.File(embeddings_h5, "r") as h5:
@@ -70,17 +91,28 @@ class DistillDataset(Dataset):
                          else np.arange(len(pd.read_csv(segments_csv, nrows=0).columns)) % n_folds
                          if False else np.arange(len(written)) % n_folds)
 
-        # Load cached mel memmap (float16, instant random access)
-        memmap_path = embeddings_h5 + ".mels.npy"
+        from cache_mels import _resolve_mels_path
         n_mels, T = get_mel_shape(cfg)
         N = len(written)
-        if not Path(memmap_path).exists():
+        memmap_path = _resolve_mels_path(embeddings_h5)
+        self.mels: np.memmap | None = None
+
+        if self.live_mels:
+            # Live-build path: keep segment audio metadata for on-the-fly mel.
+            seg = pd.read_csv(segments_csv, low_memory=False,
+                               usecols=["source_file", "start_sec", "end_sec"])
+            self.source_files = seg["source_file"].astype(str).values
+            self.start_secs = seg["start_sec"].astype(np.float64).values
+            self.end_secs = seg["end_sec"].astype(np.float64).values
+        elif Path(memmap_path).exists():
+            self.mels = np.memmap(memmap_path, dtype=np.float16, mode="r",
+                                   shape=(N, n_mels, T))
+        else:
             raise FileNotFoundError(
                 f"Mel cache not found: {memmap_path}\n"
-                f"Run 'python src/cache_mels.py --distill' first."
+                f"Either rebuild with `python src/cache_mels.py`, or set "
+                f"stage1d.live_mels=true in config to compute mels on the fly."
             )
-        self.mels = np.memmap(memmap_path, dtype=np.float16, mode="r",
-                              shape=(N, n_mels, T))
 
         # Only use segments with valid embeddings
         valid = np.where(written)[0]
@@ -97,11 +129,57 @@ class DistillDataset(Dataset):
     def __len__(self):
         return len(self.indices)
 
+    def _mel_for_index(self, i: int) -> torch.Tensor:
+        """Return (1, n_mels, T) float32 mel for segment i.
+
+        Cached path: float16 memmap read (~0.01ms).
+        Live path:   audio decode (~5-20ms) + mel STFT (~3ms).
+        """
+        if self.live_mels:
+            from cache_mels import wav_to_mel_np
+            wav = load_audio_segment(
+                str(self.source_files[i]),
+                float(self.start_secs[i]),
+                float(self.end_secs[i]),
+                sr=self.sr,
+            )
+            mel_np = wav_to_mel_np(wav, self.sr, self.mel_cfg)  # (n_mels, T)
+            return torch.from_numpy(mel_np).unsqueeze(0).float()
+        return torch.from_numpy(self.mels[i].astype(np.float32)).unsqueeze(0)
+
+    def _sample_noise_mel(self) -> torch.Tensor | None:
+        """Pick a random noise mel for overlay (cached or live path)."""
+        meta = self.noise_segment_meta or {}
+        # Live path: noise_segment_meta provides full audio metadata
+        if self.live_mels and meta.get("source_files") is not None:
+            files = meta["source_files"]
+            starts = meta["start_secs"]
+            ends = meta["end_secs"]
+            if len(files) == 0:
+                return None
+            j = int(torch.randint(0, len(files), (1,)).item())
+            try:
+                wav = load_audio_segment(
+                    str(files[j]), float(starts[j]), float(ends[j]), sr=self.sr,
+                )
+            except Exception:
+                return None
+            from cache_mels import wav_to_mel_np
+            mel_np = wav_to_mel_np(wav, self.sr, self.mel_cfg)
+            return torch.from_numpy(mel_np).unsqueeze(0).float()
+        # Cached path: noise_mel_indices points into the memmap
+        if (not self.live_mels and self.noise_mel_indices is not None
+                and len(self.noise_mel_indices) > 0):
+            ni = int(self.noise_mel_indices[
+                torch.randint(0, len(self.noise_mel_indices), (1,)).item()
+            ])
+            return torch.from_numpy(self.mels[ni].astype(np.float32)).unsqueeze(0)
+        return None
+
     def __getitem__(self, idx):
         i = self.indices[idx]
 
-        # Cached mel: memmap read (~0.01ms, OS page cache)
-        mel = torch.from_numpy(self.mels[i].astype(np.float32)).unsqueeze(0)  # (1, n_mels, T)
+        mel = self._mel_for_index(i)  # (1, n_mels, T)
 
         # Teacher targets (pre-loaded numpy arrays)
         global_emb = torch.from_numpy(self.global_embs[i])  # (1536,)
@@ -115,6 +193,25 @@ class DistillDataset(Dataset):
             logit_vals = torch.from_numpy(self.logit_vals[i])  # (top_k,)
         else:
             logit_vals = torch.zeros(self.top_k)
+
+        # ── Student-side augmentation (training only) ───────────────────────
+        # Teacher targets stay frozen — we only distort what the student sees.
+        if self.augment:
+            if torch.rand(1).item() < 0.5:
+                noise_mel = self._sample_noise_mel()
+                if noise_mel is not None:
+                    sig_p = mel.pow(2).mean() + 1e-10
+                    noi_p = noise_mel.pow(2).mean() + 1e-10
+                    snr_db = float(torch.empty(1).uniform_(0.0, 20.0).item())
+                    scale = torch.sqrt(
+                        sig_p / (noi_p * (10.0 ** (snr_db / 10.0)))
+                    )
+                    mel = mel + scale * noise_mel
+                    lo, hi = mel.min(), mel.max()
+                    mel = (mel - lo) / (hi - lo + 1e-8)
+
+            mel = spec_augment(mel, time_mask_pct=0.2, freq_mask_pct=0.2,
+                                num_time_masks=2, num_freq_masks=2)
 
         return mel, global_emb, spatial_emb, logit_vals
 
@@ -148,6 +245,7 @@ def collate_fn(batch):
 
 
 def train_one_epoch(model, loader, optimizer, criterion, device, scaler,
+                    mixup_alpha: float = 0.0, use_logit_loss: bool = False,
                     logger=None):
     model.train()
     total_loss = 0.0
@@ -162,11 +260,22 @@ def train_one_epoch(model, loader, optimizer, criterion, device, scaler,
         t_spatial = t_spatial.to(device)
         t_logits = t_logits.to(device)
 
+        # Batch-level mixup on the student input; teacher targets are
+        # convex-combined with the same lambda.
+        if mixup_alpha > 0:
+            mels, t_global, t_spatial, t_logits, _lam = mixup_pair(
+                mels, t_global, t_spatial, t_logits, alpha=mixup_alpha,
+            )
+
         with torch.amp.autocast("cuda", enabled=scaler is not None,
                                  dtype=torch.bfloat16):
-            s_global, s_spatial = model(mels, normalize=False)
-            # Student logit head (optional — reuse global projection)
-            s_logits = None  # not adding a logit head to keep model simple
+            if use_logit_loss:
+                s_global, s_spatial, s_logits = model(
+                    mels, normalize=False, return_logits=True,
+                )
+            else:
+                s_global, s_spatial = model(mels, normalize=False)
+                s_logits = None
             loss, breakdown = criterion(s_global, t_global,
                                         s_spatial, t_spatial,
                                         s_logits, t_logits)
@@ -246,25 +355,73 @@ def main(cfg: dict):
     use_amp = device.type == "cuda"
     logger.info(f"Stage 1d: Student Distillation — fold {fold}, device {device}")
 
+    live_mels = bool(scfg.get("live_mels", False))
+    logger.info(f"Mel mode: {'LIVE (per-sample audio decode)' if live_mels else 'CACHED memmap'}")
+
+    # ── Noise pool ─────────────────────────────────────────────────────────
+    # Unlabeled soundscape segments → mel overlay at a random SNR.
+    # Live path keeps audio metadata; cached path keeps mel-row indices.
+    import pandas as pd
+    _seg = pd.read_csv(
+        cfg["outputs"]["segments_csv"], low_memory=False,
+        usecols=["source_file", "start_sec", "end_sec",
+                  "source_type", "label_quality"],
+    )
+    noise_mask = (
+        (_seg["source_type"].astype(str).values == "soundscape")
+        & (_seg["label_quality"].astype(str).values == "unlabeled")
+    )
+    noise_idx_full = np.where(noise_mask)[0]
+    if live_mels:
+        # Cap the noise candidate pool: 127k is overkill, and full file
+        # paths held in worker memory add up. 5k is plenty for variety.
+        cap = min(5000, len(noise_idx_full))
+        if len(noise_idx_full) > cap:
+            rng_pick = np.random.default_rng(42)
+            noise_idx_full = rng_pick.choice(noise_idx_full, size=cap, replace=False)
+        noise_segment_meta = {
+            "source_files": _seg["source_file"].astype(str).values[noise_idx_full],
+            "start_secs": _seg["start_sec"].astype(np.float64).values[noise_idx_full],
+            "end_secs": _seg["end_sec"].astype(np.float64).values[noise_idx_full],
+        }
+        logger.info(f"Noise pool (live, sampled from unlabeled soundscape): "
+                    f"{len(noise_idx_full)}")
+    else:
+        noise_segment_meta = {"indices": noise_idx_full}
+        logger.info(f"Noise pool (cached mels, unlabeled soundscape): "
+                    f"{len(noise_idx_full)}")
+
     # Datasets
+    augment_train = bool(scfg.get("augment", True))
     ds_main = DistillDataset(
         cfg["outputs"]["segments_csv"],
         cfg["outputs"]["embeddings_h5"],
         cfg, fold=fold, split="train",
+        augment=augment_train, noise_segment_meta=noise_segment_meta,
+        live_mels=live_mels,
     )
     val_ds = DistillDataset(
         cfg["outputs"]["segments_csv"],
         cfg["outputs"]["embeddings_h5"],
         cfg, fold=fold, split="val",
+        augment=False, live_mels=live_mels,
     )
-    logger.info("Embeddings + cached mels loaded (zero I/O during training)")
+    logger.info(
+        f"Embeddings loaded (zero embedding I/O during training); "
+        f"train augment={augment_train}"
+    )
 
     # Optionally add distill corpus (no fold splitting — always in train)
     distill_h5 = cfg["outputs"].get("distill_embeddings_h5", "")
     distill_seg = cfg["outputs"].get("distill_segments_csv", "")
     if distill_h5 and Path(distill_h5).exists() and Path(distill_seg).exists():
+        # Distill corpus has no unlabeled soundscapes; pass an empty meta
+        # so only SpecAugment + mixup apply (no noise overlay).
+        empty_meta = {} if live_mels else {"indices": np.array([], dtype=np.int64)}
         ds_distill = DistillDataset(
             distill_seg, distill_h5, cfg, fold=-1, split="train",
+            augment=augment_train, noise_segment_meta=empty_meta,
+            live_mels=live_mels,
         )
         train_ds = ConcatDataset([ds_main, ds_distill])
         logger.info(f"Train: {len(ds_main)} main + {len(ds_distill)} distill = {len(train_ds)}")
@@ -289,6 +446,10 @@ def main(cfg: dict):
     # Model
     logger.info("Loading EfficientNet-B1-BirdSet backbone...")
     model = StudentEmbedder.from_pretrained()
+    use_logit_loss = bool(scfg.get("use_logit_loss", True))
+    if use_logit_loss:
+        model.attach_logit_head(top_k=cfg["stage1"]["top_k_logits"])
+        logger.info(f"Attached logit head (top_k={cfg['stage1']['top_k_logits']})")
     model = model.to(device)
     n_params = sum(p.numel() for p in model.parameters())
     logger.info(f"Model params: {n_params:,}")
@@ -298,13 +459,15 @@ def main(cfg: dict):
         lambda_global=scfg.get("lambda_global", 1.0),
         lambda_spatial=scfg.get("lambda_spatial", 1.0),
         lambda_logit=scfg.get("lambda_logit", 0.15),
-        use_logit_loss=False,  # no logit head on student — keep it simple
+        use_logit_loss=use_logit_loss,
     )
 
     # Optimizer — lower lr for backbone, higher for heads
     backbone_params = list(model.backbone.parameters())
     head_params = (list(model.global_head.parameters())
                    + list(model.spatial_proj.parameters()))
+    if use_logit_loss and model.logit_head is not None:
+        head_params += list(model.logit_head.parameters())
     optimizer = torch.optim.AdamW([
         {"params": backbone_params, "lr": scfg.get("backbone_lr", 1e-5)},
         {"params": head_params,     "lr": scfg.get("head_lr", 1e-4)},
@@ -350,9 +513,15 @@ def main(cfg: dict):
     patience = scfg.get("early_stop_patience", 10)
     epochs_without_improvement = 0
 
+    mixup_alpha = float(scfg.get("mixup_alpha", 0.2))
+    logger.info(f"Augment: specaug={augment_train}  mixup_alpha={mixup_alpha}  "
+                f"logit_loss={use_logit_loss}")
+
     for epoch in range(max_epochs):
         train_metrics = train_one_epoch(model, train_dl, optimizer,
                                          criterion, device, scaler,
+                                         mixup_alpha=mixup_alpha,
+                                         use_logit_loss=use_logit_loss,
                                          logger=logger)
         val_loss, val_cos = evaluate(model, val_dl, criterion, device)
         scheduler.step()

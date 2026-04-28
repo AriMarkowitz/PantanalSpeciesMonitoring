@@ -13,8 +13,15 @@
 # Prototypical probing head on frozen Student spatial embeddings.
 #
 # Usage:
-#   sbatch scripts/train_proto.sh                  # fold 0
-#   FOLD=2 sbatch scripts/train_proto.sh           # specific fold
+#   sbatch scripts/train_proto.sh                         # fold 0, from scratch
+#   FOLD=2 sbatch scripts/train_proto.sh                  # specific fold
+#   RESUME=1 sbatch scripts/train_proto.sh                # resume fold0_last.pt
+#   RESUME=auto sbatch scripts/train_proto.sh             # resume if last.pt exists
+#   RESUME=path/to/ckpt.pt sbatch scripts/train_proto.sh  # resume from specific ckpt
+#
+# To continue training beyond the original epoch budget, raise
+# probe.epochs in configs/default.yaml (or pass --set probe.epochs=60)
+# before resuming.
 
 PROJECT_DIR="$HOME/PantanalSpeciesMonitoring"
 ENV_NAME="pantanal"
@@ -37,6 +44,10 @@ echo "Fold: ${FOLD:-0}"
 echo "---"
 
 export FOLD="${FOLD:-0}"
+export RESUME="${RESUME:-}"
+
+echo "FOLD=$FOLD  RESUME=${RESUME:-<none>}"
+echo "---"
 
 python src/train_proto.py --config configs/default.yaml
 

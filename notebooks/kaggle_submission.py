@@ -138,17 +138,28 @@ assert os.path.isfile(os.path.join(BIRDSET_MODEL_DIR, "config.json")), (
 
 class StudentEmbedder(nn.Module):
     def __init__(self, backbone, backbone_hidden=1280,
-                 embed_dim=PERCH_EMBED_DIM, spatial_h=SPATIAL_H):
+                 embed_dim=PERCH_EMBED_DIM, spatial_h=SPATIAL_H,
+                 hidden_mlp=2048):
         super().__init__()
         self.backbone = backbone
         self.spatial_h = spatial_h
         self.global_head = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
             nn.Flatten(),
-            nn.Linear(backbone_hidden, embed_dim),
+            nn.Linear(backbone_hidden, hidden_mlp),
+            nn.GELU(),
+            nn.LayerNorm(hidden_mlp),
+            nn.Linear(hidden_mlp, embed_dim),
         )
         self.spatial_pool = nn.AdaptiveAvgPool2d((spatial_h, 1))
-        self.spatial_proj = nn.Linear(backbone_hidden, embed_dim)
+        self.spatial_proj = nn.Sequential(
+            nn.Linear(backbone_hidden, hidden_mlp),
+            nn.GELU(),
+            nn.LayerNorm(hidden_mlp),
+            nn.Linear(hidden_mlp, embed_dim),
+        )
+        # Optional logit head — only needed at train time; inference doesn't use it.
+        self.logit_head = None
 
     @classmethod
     def from_pretrained(cls, backbone_path=BIRDSET_MODEL_DIR,

@@ -11,6 +11,7 @@ Usage:
 """
 
 import argparse
+import os
 import sys
 import numpy as np
 import pandas as pd
@@ -20,6 +21,21 @@ from multiprocessing import Pool
 
 from config import get_config
 from utils import setup_logging, load_audio_segment
+
+
+def _resolve_mels_path(h5_path: str) -> str:
+    """Return the on-disk path for the mel memmap.
+
+    Default: alongside the HDF5 (e.g. embeddings.h5.mels.npy).
+    Override via env var MELS_CACHE_DIR (e.g. /tmp/$SLURM_JOB_ID) — useful
+    for HPC node-local scratch when home quota is tight.
+    """
+    cache_dir = os.environ.get("MELS_CACHE_DIR", "").strip()
+    base = Path(h5_path).name + ".mels.npy"
+    if cache_dir:
+        Path(cache_dir).mkdir(parents=True, exist_ok=True)
+        return str(Path(cache_dir) / base)
+    return h5_path + ".mels.npy"
 
 
 def _build_mel_basis(sr: int, mel_cfg: dict):
@@ -126,7 +142,7 @@ def cache_mels_memmap(segments_csv: str, h5_path: str, cfg: dict, logger,
     N = len(segments)
     n_mels, T = get_mel_shape(cfg)
 
-    memmap_path = h5_path + ".mels.npy"
+    memmap_path = _resolve_mels_path(h5_path)
     size_gb = N * n_mels * T * 2 / 1e9  # float16
     logger.info(f"Mel shape: ({n_mels}, {T}), N={N}, storage: {size_gb:.1f} GB (float16)")
     logger.info(f"Output: {memmap_path}")

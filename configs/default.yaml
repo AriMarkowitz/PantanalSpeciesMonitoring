@@ -74,7 +74,7 @@ probe:
   weight_decay: 1.0e-4
   ortho_weight: 0.1
   batch_size: 256
-  epochs: 30
+  epochs: 100                  # bumped from 30; val AUC was still climbing at ep30
   num_workers: 0
   preload: true                # hold spatial_embeddings in RAM (~11 GB) during training
   fold: 0
@@ -103,17 +103,21 @@ stage4:
 stage1d:
   backbone: DBD-research-group/EfficientNet-B1-BirdSet-XCL
   embed_dim: 1536
-  epochs: 60
+  epochs: 80                 # bumped from 60; augmentation slows convergence
   batch_size: 256
-  num_workers: 4
-  prefetch_factor: 2
-  backbone_lr: 2.0e-4      # scaled 4x for batch_size=256
-  head_lr: 4.0e-3          # scaled 4x for batch_size=256
+  num_workers: 8
+  prefetch_factor: 4
+  live_mels: false           # cached mel memmap path (live decode is GPU-starving with shuffled XC files)
+  backbone_lr: 2.0e-4        # scaled 4x for batch_size=256
+  head_lr: 4.0e-3            # scaled 4x for batch_size=256
   weight_decay: 1.0e-4
   lambda_global: 1.0
-  lambda_spatial: 0.5      # reduce spatial weight — harder to match, drags global down
-  lambda_logit: 0.15
-  target_cosine_sim: 0.93  # log when this threshold is reached
+  lambda_spatial: 1.0        # restored to parity: augmentation should let spatial match without dragging global
+  lambda_logit: 0.3          # bumped from 0.15 — logits are species-discriminative, valuable for probe downstream
+  use_logit_loss: true       # student gets a small linear logit head trained to match Perch's top-k logits
+  augment: true              # per-sample SpecAugment + mel-space noise overlay (unlabeled soundscape)
+  mixup_alpha: 0.2           # batch-level mixup on student input + convex-combined teacher targets
+  target_cosine_sim: 0.95    # bumped from 0.93 — augmentation + MLP head + logit loss should clear this
   wandb_project: pantanal-monitoring
 
 student_mel:

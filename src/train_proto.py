@@ -213,12 +213,68 @@ def main(cfg: dict):
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
     criterion = MaskedBCEWithOrthoLoss(ortho_weight=ortho_weight)
 
-    # ── Train ──────────────────────────────────────────────────────────────
     ckpt_dir = Path(cfg["outputs"]["checkpoints_dir"]) / "proto_probe"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     best_auc = -1.0
+    start_epoch = 1
 
-    for ep in range(1, epochs + 1):
+    # ── Resume from last checkpoint if requested ────────────────────────────
+    # RESUME=1 → resume from fold{FOLD}_last.pt (full state: model+opt+sched).
+    # RESUME=auto → resume if last.pt exists, else start fresh.
+    # RESUME=path/to/ckpt.pt → resume from a specific file (model state only
+    #                          if it's a *_best.pt, otherwise full state).
+    resume = os.environ.get("RESUME", "")
+    resume_path = None
+    if resume == "1":
+        resume_path = ckpt_dir / f"fold{fold}_last.pt"
+        if not resume_path.exists():
+            raise FileNotFoundError(
+                f"RESUME=1 but no checkpoint at {resume_path}. "
+                f"Run without RESUME first, or pass RESUME=<path> to an existing ckpt."
+            )
+    elif resume == "auto":
+        cand = ckpt_dir / f"fold{fold}_last.pt"
+        if cand.exists():
+            resume_path = cand
+    elif resume:
+        resume_path = Path(resume)
+        if not resume_path.exists():
+            raise FileNotFoundError(f"RESUME path does not exist: {resume_path}")
+
+    if resume_path is not None:
+        logger.info(f"Resuming from {resume_path}")
+        state = torch.load(resume_path, map_location=device, weights_only=False)
+        head.load_state_dict(state["model_state_dict"])
+        if "optimizer_state_dict" in state:
+            opt.load_state_dict(state["optimizer_state_dict"])
+        if "scheduler_state_dict" in state:
+            sched.load_state_dict(state["scheduler_state_dict"])
+        start_epoch = int(state.get("epoch", 0)) + 1
+        best_auc = float(state.get("best_auc", state.get("val_auc", -1.0)))
+        logger.info(
+            f"  resumed at epoch={start_epoch}, best_auc={best_auc:.4f}  "
+            f"(target: {epochs} total epochs)"
+        )
+        if start_epoch > epochs:
+            logger.warning(
+                f"start_epoch ({start_epoch}) > epochs ({epochs}); "
+                f"raise probe.epochs in config to train further."
+            )
+
+    # ── Train ──────────────────────────────────────────────────────────────
+    def _save(path: Path, val_auc: float, ep: int):
+        torch.save({
+            "model_state_dict": head.state_dict(),
+            "optimizer_state_dict": opt.state_dict(),
+            "scheduler_state_dict": sched.state_dict(),
+            "config": {"J": J, "D": D, "num_classes": num_species},
+            "val_auc": val_auc,
+            "best_auc": best_auc,
+            "fold": fold,
+            "epoch": ep,
+        }, path)
+
+    for ep in range(start_epoch, epochs + 1):
         t0 = time.time()
         tr_loss = train_one_epoch(head, train_dl, opt, criterion, device)
         val_loss, val_auc = evaluate(head, val_dl, criterion, device)
@@ -230,14 +286,10 @@ def main(cfg: dict):
         )
         if val_auc > best_auc:
             best_auc = val_auc
-            torch.save({
-                "model_state_dict": head.state_dict(),
-                "config": {"J": J, "D": D, "num_classes": num_species},
-                "val_auc": val_auc,
-                "fold": fold,
-                "epoch": ep,
-            }, ckpt_dir / f"fold{fold}_best.pt")
+            _save(ckpt_dir / f"fold{fold}_best.pt", val_auc, ep)
             logger.info(f"  → new best val_auc={val_auc:.4f}, saved")
+        # Always checkpoint the latest state for resume
+        _save(ckpt_dir / f"fold{fold}_last.pt", val_auc, ep)
 
     logger.info(f"Fold {fold} done. best_val_auc={best_auc:.4f}")
 

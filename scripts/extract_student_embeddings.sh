@@ -36,16 +36,25 @@ export TF_CPP_MIN_LOG_LEVEL=3
 export TOKENIZERS_PARALLELISM=false
 export PYTHONUNBUFFERED=1
 
+# ── Node-local mel cache ───────────────────────────────────────────────────
+export MELS_CACHE_DIR="/tmp/${SLURM_JOB_ID:-$$}/mels"
+mkdir -p "$MELS_CACHE_DIR"
+trap 'rm -rf "$MELS_CACHE_DIR" 2>/dev/null || true' EXIT
+
 echo "Job ID: $SLURM_JOB_ID"
 echo "GPU: $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null)"
+echo "MELS_CACHE_DIR=$MELS_CACHE_DIR"
+df -h /tmp | tail -1
 echo "---"
 
-# Auto-select best student checkpoint
+# ── Step 1: Build mel cache (primary + distill) to /tmp ────────────────────
+echo "=== Caching mels to $MELS_CACHE_DIR ==="
+python src/cache_mels.py --distill
+du -sh "$MELS_CACHE_DIR"
+echo "---"
+
+# ── Step 2: Extract student embeddings ─────────────────────────────────────
 CKPT=${STUDENT_CKPT:-""}
 python src/extract_student_embeddings.py ${CKPT:+--ckpt "$CKPT"}
 
-# Clean up mel caches (48GB) — no longer needed after extraction
-echo "Cleaning up mel caches..."
-rm -f outputs/embeddings/embeddings.h5.mels.npy
-rm -f outputs/embeddings/distill_embeddings.h5.mels.npy
 echo "Student embedding extraction complete (job=$SLURM_JOB_ID)."

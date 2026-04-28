@@ -57,9 +57,10 @@ def main():
     student = student.to(device).eval()
     logger.info(f"Student loaded (val_cos_sim={state.get('val_cosine_sim', '?')})")
 
-    # Load cached mels (memmap)
+    # Load cached mels (memmap) — supports MELS_CACHE_DIR override for HPC scratch
+    from cache_mels import _resolve_mels_path
     h5_path = cfg["outputs"]["embeddings_h5"]
-    memmap_path = h5_path + ".mels.npy"
+    memmap_path = _resolve_mels_path(h5_path)
     if not Path(memmap_path).exists():
         raise FileNotFoundError(f"Mel cache not found: {memmap_path}")
 
@@ -123,7 +124,7 @@ def main():
 
     # Also extract distill corpus if it exists
     distill_h5 = cfg["outputs"].get("distill_embeddings_h5", "")
-    distill_memmap = distill_h5 + ".mels.npy" if distill_h5 else ""
+    distill_memmap = _resolve_mels_path(distill_h5) if distill_h5 else ""
     if distill_h5 and Path(distill_memmap).exists():
         logger.info(f"Extracting distill corpus...")
         with h5py.File(distill_h5, "r") as h5d:
